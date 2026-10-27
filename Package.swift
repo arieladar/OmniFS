@@ -8,6 +8,7 @@ let package = Package(
     ],
     products: [
         .library(name: "OmniFSCore", targets: ["OmniFSCore"]),
+        .library(name: "OmniFSPrefPane", type: .dynamic, targets: ["OmniFSPrefPane"]),
         .executable(name: "omnifs", targets: ["OmniFSCLI"]),
         .executable(name: "OmniFSSettings", targets: ["OmniFSSettings"]),
     ],
@@ -17,6 +18,15 @@ let package = Package(
             name: "OmniFSCore",
             dependencies: [],
             path: "Sources/OmniFSCore"
+        ),
+        .target(
+            name: "OmniFSPrefPane",
+            dependencies: ["OmniFSCore"],
+            path: "Sources/OmniFSPrefPane",
+            linkerSettings: [
+                .linkedFramework("PreferencePanes"),
+                .linkedFramework("Cocoa")
+            ]
         ),
         .executableTarget(
             name: "OmniFSCLI",
