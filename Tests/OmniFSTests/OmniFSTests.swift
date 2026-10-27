@@ -166,4 +166,63 @@ struct OmniFSTests {
         #expect(opts.allowOther == true)
         #expect(opts.customMountPoint == "/Volumes/TestDrive")
     }
+
+    @Test func testSettingsPanes() {
+        let panes = SettingsPane.allCases
+        #expect(panes.count == 4)
+        #expect(panes.map(\.rawValue) == ["Volumes", "Formats", "Options", "About"])
+        for pane in panes {
+            #expect(!pane.title.isEmpty)
+            #expect(!pane.iconName.isEmpty)
+        }
+    }
+
+    @Test func testSamplePartitions() {
+        let samples = DiskPartition.samples
+        #expect(samples.count == 3)
+        #expect(DiskPartition.sampleExt4.fileSystemType == .ext4)
+        #expect(DiskPartition.sampleExt4.isMounted == true)
+        #expect(DiskPartition.sampleNTFS.fileSystemType == .ntfs)
+        #expect(DiskPartition.sampleNTFS.isMounted == false)
+        #expect(DiskPartition.sampleBtrfs.fileSystemType == .btrfs)
+        #expect(DiskPartition.sampleBtrfs.isReadOnly == true)
+    }
+
+    @Test func testInternalMacDiskExclusion() {
+        let macInternalAPFS = DiskPartition(
+            bsdName: "disk0s2",
+            totalSizeBytes: 500_000_000_000,
+            volumeName: "Macintosh HD",
+            fileSystemType: .apfs,
+            mountPoint: "/",
+            isReadOnly: true,
+            isRemovable: false,
+            isInternal: true
+        )
+        #expect(macInternalAPFS.isForeignOrRemovable == false)
+
+        let macRecovery = DiskPartition(
+            bsdName: "disk0s3",
+            totalSizeBytes: 5_000_000_000,
+            volumeName: "Recovery",
+            fileSystemType: .apfs,
+            mountPoint: nil,
+            isReadOnly: true,
+            isRemovable: false,
+            isInternal: true
+        )
+        #expect(macRecovery.isForeignOrRemovable == false)
+
+        let externalExt4 = DiskPartition(
+            bsdName: "disk4s1",
+            totalSizeBytes: 64_000_000_000,
+            volumeName: "LinuxUSB",
+            fileSystemType: .ext4,
+            mountPoint: nil,
+            isReadOnly: false,
+            isRemovable: true,
+            isInternal: false
+        )
+        #expect(externalExt4.isForeignOrRemovable == true)
+    }
 }

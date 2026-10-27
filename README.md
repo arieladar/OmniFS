@@ -68,9 +68,31 @@ swift run omnifs inspect /dev/disk3s1
 
 ---
 
-## Launching the Settings App
+## Installation & Packaging
 
-To run the OmniFS Settings interface:
+### Option 1: Build & Mount the Signed DMG (Recommended)
+Generate the complete macOS distribution disk image:
+
+```bash
+./build_dmg.sh
+```
+
+This compiles release binaries, signs all bundles, and generates `OmniFS.dmg` containing:
+* `OmniFS.prefPane` (macOS System Settings pane)
+* `OmniFS.app` (Standalone Settings app)
+* `Applications` drag-and-drop symlink
+* `Install OmniFS.command` (one-click installer script)
+
+To install, simply open `OmniFS.dmg` and double-click **Install OmniFS.command** (or drag `OmniFS.prefPane` into `~/Library/PreferencePanes/`).
+
+### Option 2: Quick Script Install
+Install directly from the repository into your user profile and launch System Settings:
+
+```bash
+./install.sh
+```
+
+### Option 3: Launch in Development Mode
 
 ```bash
 swift run OmniFSSettings

@@ -29,16 +29,25 @@ public actor DiskScanner {
                let allDisksAndPartitions = plist["AllDisksAndPartitions"] as? [[String: Any]] {
 
                 for diskEntry in allDisksAndPartitions {
+                    let parentContent = (diskEntry["Content"] as? String) ?? ""
+                    
                     if let partitions = diskEntry["Partitions"] as? [[String: Any]] {
                         for part in partitions {
                             if let partition = await parsePartitionEntry(part) {
-                                results.append(partition)
+                                if partition.isForeignOrRemovable {
+                                    results.append(partition)
+                                }
                             }
                         }
                     } else if let diskIdentifier = diskEntry["DeviceIdentifier"] as? String {
-                        // Whole disk without partition map
+                        // Skip whole Apple APFS synthetic containers or GUID partition schemes
+                        if parentContent.contains("APFS") || parentContent.contains("GUID") {
+                            continue
+                        }
                         if let single = await inspectDisk(bsdName: diskIdentifier) {
-                            results.append(single)
+                            if single.isForeignOrRemovable {
+                                results.append(single)
+                            }
                         }
                     }
                 }
@@ -65,6 +74,18 @@ public actor DiskScanner {
         // Query diskutil info -plist for detailed metadata
         let infoDict = fetchDiskInfo(bsdName: bsdName) ?? hintDict ?? [:]
 
+        let isInternal = (infoDict["Internal"] as? Bool) ?? false
+        let isRemovable = (infoDict["Removable"] as? Bool)
+            ?? (infoDict["RemovableMedia"] as? Bool)
+            ?? (infoDict["Ejectable"] as? Bool)
+            ?? false
+
+        let content = (infoDict["Content"] as? String) ?? ""
+        let busProtocol = (infoDict["BusProtocol"] as? String) ?? ""
+
+        // Fast exclusion: If it's the internal Mac bus or Apple system container, skip immediately unless probed foreign
+        let isAppleFabricOrInternal = isInternal || busProtocol.contains("Apple Fabric") || busProtocol.contains("Internal")
+
         let sizeBytes = (infoDict["Size"] as? NSNumber)?.uint64Value
             ?? (infoDict["TotalSize"] as? NSNumber)?.uint64Value
             ?? 0
@@ -72,14 +93,18 @@ public actor DiskScanner {
         var volumeName = (infoDict["VolumeName"] as? String) ?? ""
         let mountPoint = infoDict["MountPoint"] as? String
         let isReadOnly = (infoDict["Writable"] as? Bool == false)
-        let isRemovable = (infoDict["Removable"] as? Bool)
-            ?? (infoDict["RemovableMedia"] as? Bool)
-            ?? true
 
-        // Let's sniff the superblock to identify foreign filesystems
+        // Sniff the superblock to identify foreign filesystems (ext2/3/4, NTFS, Btrfs, XFS)
         var meta = sniffer.probe(devicePath: rawPath)
         if meta == nil {
             meta = sniffer.probe(devicePath: devicePath)
+        }
+
+        // If internal Mac drive and no foreign superblock was detected, ignore it
+        if isAppleFabricOrInternal && meta == nil {
+            if content.starts(with: "Apple_") || content == "EFI" || content.isEmpty {
+                return nil
+            }
         }
 
         let detectedType: FileSystemType
@@ -94,6 +119,11 @@ public actor DiskScanner {
             detectedType = .unknown(magic: "unrecognized")
         }
 
+        // Never expose internal Mac APFS or HFS system partitions
+        if isAppleFabricOrInternal && (detectedType.family == .apple || detectedType == .apfs || detectedType == .hfsplus) {
+            return nil
+        }
+
         if volumeName.isEmpty {
             volumeName = bsdName
         }
@@ -106,7 +136,8 @@ public actor DiskScanner {
             metadata: meta,
             mountPoint: mountPoint,
             isReadOnly: isReadOnly,
-            isRemovable: isRemovable
+            isRemovable: isRemovable,
+            isInternal: isInternal
         )
     }
 
