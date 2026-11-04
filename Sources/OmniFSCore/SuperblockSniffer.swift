@@ -7,11 +7,11 @@ public struct SuperblockSniffer: Sendable {
 
     /// Sniffs the filesystem from an open FileHandle at the current or specified offset.
     public func probe(fileHandle: FileHandle) -> SuperblockMetadata? {
-        // Read the first 128KB to cover sector 0 (NTFS, XFS, FAT/exFAT, APFS),
-        // sector 2 (ext2/3/4 at 1024), and 64KB (Btrfs at 65536).
+        // Read the first 256KB to cover sector 0 (NTFS, XFS, FAT/exFAT, APFS), sector 2 (ext2/3/4 at 1024),
+        // 64KB (Btrfs at 65536) and the first ZFS label (pool config at 16KB, uberblocks from 128KB).
         do {
             try fileHandle.seek(toOffset: 0)
-            guard let headerData = try fileHandle.read(upToCount: 131072), headerData.count >= 1024 else {
+            guard let headerData = try fileHandle.read(upToCount: 262144), headerData.count >= 1024 else {
                 return nil
             }
             return probe(data: headerData)
@@ -31,6 +31,11 @@ public struct SuperblockSniffer: Sendable {
 
     /// Sniffs filesystem metadata from an in-memory buffer containing the first 128KB of the disk/partition.
     public func probe(data: Data) -> SuperblockMetadata? {
+        // 0. Check F2FS (Offset 1024, magic 0xF2F52010); before ext, which also has its superblock at 1024
+        if let f2fs = probeF2FS(data: data) {
+            return f2fs
+        }
+
         // 1. Check ext2 / ext3 / ext4 (Offset 1024, length 1024)
         if let ext = probeExt(data: data) {
             return ext
@@ -46,17 +51,27 @@ public struct SuperblockSniffer: Sendable {
             return btrfs
         }
 
-        // 4. Check XFS (Offset 0, Magic "XFSB")
+        // 4. Check ZFS (uberblock magic 0x00bab10c from offset 128KB)
+        if let zfs = probeZFS(data: data) {
+            return zfs
+        }
+
+        // 5. Check XFS (Offset 0, Magic "XFSB")
         if let xfs = probeXFS(data: data) {
             return xfs
         }
 
-        // 5. Check exFAT (Offset 3, "EXFAT   ")
+        // 6. Check UDF (volume recognition sequence at 32KB, "NSR02"/"NSR03")
+        if let udf = probeUDF(data: data) {
+            return udf
+        }
+
+        // 7. Check exFAT (Offset 3, "EXFAT   ")
         if let exfat = probeExFAT(data: data) {
             return exfat
         }
 
-        // 6. Check VFAT / FAT32 (Offset 54 / 82)
+        // 8. Check VFAT / FAT32 (Offset 54 / 82)
         if let vfat = probeVFAT(data: data) {
             return vfat
         }
@@ -214,6 +229,120 @@ public struct SuperblockSniffer: Sendable {
             lastMountTime: nil,
             featuresDescription: "Btrfs Subvolume/Tree filesystem"
         )
+    }
+
+    // MARK: - F2FS Sniffer
+
+    private func probeF2FS(data: Data) -> SuperblockMetadata? {
+        let sb = 1024
+        guard data.count >= sb + 124 + 1024, readUInt32LE(data: data, offset: sb) == 0xF2F52010 else { return nil }
+        let logBlockSize = readUInt32LE(data: data, offset: sb + 16)
+        let blockSize: UInt32 = logBlockSize < 32 ? 1 << logBlockSize : 4096
+        // volume_name: 512 UTF-16LE code units at offset 124
+        let nameData = data.subdata(in: (sb + 124)..<(sb + 124 + 1024))
+        let name = String(data: nameData, encoding: .utf16LittleEndian)?
+            .split(separator: "\0", maxSplits: 1, omittingEmptySubsequences: false).first.map(String.init)
+        return SuperblockMetadata(
+            fileSystemType: .f2fs,
+            volumeName: name?.isEmpty == false ? name : nil,
+            uuid: formatUUID(data.subdata(in: (sb + 108)..<(sb + 124))),
+            blockSize: blockSize,
+            totalBlocks: readUInt64LE(data: data, offset: sb + 36),
+            freeBlocks: nil,
+            isClean: nil,
+            lastMountTime: nil,
+            featuresDescription: "F2FS \(readUInt16LE(data: data, offset: sb + 4)).\(readUInt16LE(data: data, offset: sb + 6))"
+        )
+    }
+
+    // MARK: - UDF Sniffer
+
+    private func probeUDF(data: Data) -> SuperblockMetadata? {
+        // Volume recognition sequence: 2048-byte descriptors from 32KB, identifier at byte 1 of each
+        var offset = 32 * 1024
+        var revision: String?
+        while offset + 6 <= data.count && offset < 32 * 1024 + 16 * 2048 {
+            guard let identifier = String(data: data.subdata(in: (offset + 1)..<(offset + 6)), encoding: .ascii) else { break }
+            if identifier == "NSR02" || identifier == "NSR03" {
+                revision = identifier
+                break
+            }
+            guard ["BEA01", "CD001", "CDW02", "BOOT2"].contains(identifier) else { break }
+            offset += 2048
+        }
+        guard let revision else { return nil }
+        return SuperblockMetadata(
+            fileSystemType: .udf,
+            featuresDescription: revision == "NSR03" ? "UDF 2.00 or later" : "UDF 1.50 or earlier"
+        )
+    }
+
+    // MARK: - ZFS Sniffer
+
+    private func probeZFS(data: Data) -> SuperblockMetadata? {
+        // Uberblock ring of label 0 starts at 128KB; slots are 1KB (ashift 9) up to 8KB (ashift 13), any may be in use
+        let ringStart = 128 * 1024
+        let magic: UInt64 = 0x00bab10c
+        var found = false
+        var offset = ringStart
+        while offset + 8 <= data.count && offset < ringStart + 128 * 1024 {
+            if readUInt64LE(data: data, offset: offset) == magic || readUInt64BE(data: data, offset: offset) == magic {
+                found = true
+                break
+            }
+            offset += 1024
+        }
+        guard found else { return nil }
+
+        let config = parseZFSConfig(data: data)
+        return SuperblockMetadata(
+            fileSystemType: .zfs,
+            volumeName: config.name,
+            uuid: config.poolGUID.map { String(format: "%016llX", $0) },
+            blockSize: nil,
+            totalBlocks: nil,
+            freeBlocks: nil,
+            isClean: config.state.map { $0 == 1 },  // POOL_STATE_EXPORTED
+            lastMountTime: nil,
+            featuresDescription: "ZFS pool" + (config.state == 0 ? " (last used without export)" : "")
+        )
+    }
+
+    /// Reads "name", "pool_guid" and "state" from the label's XDR-encoded nvlist at offset 16KB.
+    private func parseZFSConfig(data: Data) -> (name: String?, poolGUID: UInt64?, state: UInt64?) {
+        let start = 16 * 1024
+        let end = min(data.count, 128 * 1024)
+        // 4-byte header (encoding 1 = XDR), then nvlist version and flags
+        guard end > start + 12, data[start] == 1 else { return (nil, nil, nil) }
+        var offset = start + 12
+        var name: String?
+        var guid: UInt64?
+        var state: UInt64?
+
+        func int32() -> Int? {
+            guard offset + 4 <= end else { return nil }
+            defer { offset += 4 }
+            return Int(Int32(bitPattern: readUInt32BE(data: data, offset: offset)))
+        }
+        func string() -> String? {
+            guard let length = int32(), length >= 0, offset + length <= end else { return nil }
+            defer { offset += (length + 3) & ~3 }
+            return String(data: data.subdata(in: offset..<(offset + length)), encoding: .utf8)
+        }
+
+        while let encodedSize = int32(), encodedSize > 0 {
+            let pairStart = offset - 4
+            guard int32() != nil, let key = string(), let type = int32(), int32() != nil else { break }
+            if key == "name" && type == 9 {  // DATA_TYPE_STRING
+                name = string()
+            } else if (key == "pool_guid" || key == "state") && type == 8, offset + 8 <= end {  // DATA_TYPE_UINT64
+                let value = readUInt64BE(data: data, offset: offset)
+                if key == "pool_guid" { guid = value } else { state = value }
+            }
+            offset = pairStart + encodedSize
+            if name != nil && guid != nil && state != nil { break }
+        }
+        return (name, guid, state)
     }
 
     // MARK: - XFS Sniffer

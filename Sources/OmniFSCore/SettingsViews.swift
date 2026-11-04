@@ -112,8 +112,7 @@ public struct SettingsContainerView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .frame(width: 380)
-        .frame(minHeight: 480)
+        .frame(minWidth: 560, maxWidth: .infinity, minHeight: 480, maxHeight: .infinity)
         .background(Color(nsColor: .windowBackgroundColor))
     }
 }
@@ -123,8 +122,11 @@ public struct SettingsContainerView: View {
 public struct VolumesSettingsView: View {
     @State private var partitions: [DiskPartition] = []
     @State private var isLoading = false
+    @State private var scanGeneration = 0
+    @State private var storageSignature = ""
     @State private var statusBanner: StatusBannerInfo?
     @State private var inspectedPartition: DiskPartition?
+    @State private var repairCandidate: DiskPartition?
     @State private var searchText = ""
 
     public init() {}
@@ -150,6 +152,28 @@ public struct VolumesSettingsView: View {
 
     public var body: some View {
         Form {
+            // Status banner first so mount results and errors are always visible
+            if let banner = statusBanner {
+                Section {
+                    HStack(spacing: 10) {
+                        Image(systemName: banner.isError ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                            .foregroundStyle(banner.isError ? Color.red : Color.green)
+                        Text(banner.message)
+                            .font(.callout)
+                            .textSelection(.enabled)
+                        Spacer()
+                        Button {
+                            statusBanner = nil
+                        } label: {
+                            Image(systemName: "xmark.circle")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    }
+                    .padding(.vertical, 2)
+                }
+            }
+
             // Apple-Style Storage Capacity Bar
             Section {
                 VStack(alignment: .leading, spacing: 14) {
@@ -157,7 +181,7 @@ public struct VolumesSettingsView: View {
                         VStack(alignment: .leading, spacing: 3) {
                             Text("Foreign Storage")
                                 .font(.headline)
-                            Text("Ext2/3/4, Btrfs, XFS, and NTFS volumes available on this Mac")
+                            Text("NTFS, ext2/3/4, Btrfs, XFS and ZFS volumes available on this Mac")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
@@ -169,8 +193,7 @@ public struct VolumesSettingsView: View {
                         } label: {
                             HStack(spacing: 5) {
                                 Image(systemName: "arrow.clockwise")
-                                    .rotationEffect(.degrees(isLoading ? 360 : 0))
-                                    .animation(isLoading ? .linear(duration: 1).repeatForever(autoreverses: false) : .default, value: isLoading)
+                                    .symbolEffect(.rotate, isActive: isLoading)
                                 Text("Refresh")
                             }
                         }
@@ -202,7 +225,7 @@ public struct VolumesSettingsView: View {
                         VStack(spacing: 4) {
                             Text("No Foreign Volumes Connected")
                                 .font(.headline)
-                            Text("Connect an external storage device formatted with Linux (ext4, Btrfs, XFS) or Windows (NTFS).")
+                            Text("Connect an external storage device formatted with Windows (NTFS), Linux (ext2/3/4, Btrfs, XFS) or ZFS.")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                                 .multilineTextAlignment(.center)
@@ -218,7 +241,8 @@ public struct VolumesSettingsView: View {
                             onMountRO: { Task { await mount(partition: partition, readOnly: true) } },
                             onUnmount: { Task { await unmount(partition: partition) } },
                             onReveal: { revealInFinder(partition: partition) },
-                            onInspect: { inspectedPartition = partition }
+                            onInspect: { inspectedPartition = partition },
+                            onRepair: { repairCandidate = partition }
                         )
                     }
                 }
@@ -237,44 +261,59 @@ public struct VolumesSettingsView: View {
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
-
-            // Status Banner if present
-            if let banner = statusBanner {
-                Section {
-                    HStack(spacing: 10) {
-                        Image(systemName: banner.isError ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
-                            .foregroundStyle(banner.isError ? Color.red : Color.green)
-                        Text(banner.message)
-                            .font(.callout)
-                        Spacer()
-                        Button {
-                            statusBanner = nil
-                        } label: {
-                            Image(systemName: "xmark.circle")
-                                .foregroundStyle(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                    .padding(.vertical, 2)
-                }
-            }
         }
         .formStyle(.grouped)
         .searchable(text: $searchText, prompt: "Search volumes")
+        .confirmationDialog(
+            "Check & Repair “\(repairCandidate?.volumeName ?? "")”?",
+            isPresented: Binding(get: { repairCandidate != nil }, set: { if !$0 { repairCandidate = nil } }),
+            presenting: repairCandidate
+        ) { partition in
+            Button("Check & Repair") {
+                Task { await repair(partition: partition) }
+            }
+        } message: { _ in
+            Text("The volume is unmounted while it is checked and mounted again afterwards. Checking a large drive can take a while; don't disconnect it until the check finishes.")
+        }
         .sheet(item: $inspectedPartition) { part in
             VolumeInspectorSheet(partition: part)
         }
         .task {
             await refreshDisks()
+            // VM-served (NFS) mounts, drives without a mountable volume and the omnifs CLI don't reliably notify
+            // this view, so poll a cheap snapshot and only rescan when it changes
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(3))
+                let signature = VMMountRegistry.storageSignature()
+                if signature != storageSignature {
+                    await refreshDisks(quiet: true)
+                }
+            }
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didMountNotification)) { _ in
+            Task { await refreshDisks(quiet: true) }
+        }
+        .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { _ in
+            Task { await refreshDisks(quiet: true) }
         }
     }
 
-    private func refreshDisks() async {
-        isLoading = true
-        let scanner = DiskScanner()
-        let scanned = await scanner.scanPartitions()
-        partitions = scanned
-        isLoading = false
+    private func refreshDisks(quiet: Bool = false) async {
+        // Scans can overlap (notifications, polling, user actions); only the newest one is applied
+        scanGeneration += 1
+        let generation = scanGeneration
+        if !quiet {
+            isLoading = true
+        }
+        let signature = VMMountRegistry.storageSignature()
+        let scanned = await DiskScanner().scanPartitions()
+        if generation == scanGeneration {
+            partitions = scanned
+            storageSignature = signature
+        }
+        if !quiet {
+            isLoading = false
+        }
     }
 
     private func mount(partition: DiskPartition, readOnly: Bool) async {
@@ -285,6 +324,17 @@ public struct VolumesSettingsView: View {
             await refreshDisks()
         } catch {
             statusBanner = StatusBannerInfo(message: "Failed to mount \(partition.bsdName): \(error.localizedDescription)", isError: true)
+        }
+    }
+
+    private func repair(partition: DiskPartition) async {
+        statusBanner = StatusBannerInfo(message: "Checking \(partition.volumeName)… Don't disconnect the drive.", isError: false)
+        do {
+            let res = try await MountManager.shared.repair(partition: partition)
+            statusBanner = StatusBannerInfo(message: "\(partition.volumeName): \(res.message)", isError: !res.success)
+            await refreshDisks()
+        } catch {
+            statusBanner = StatusBannerInfo(message: "Failed to check \(partition.bsdName): \(error.localizedDescription)", isError: true)
         }
     }
 
@@ -329,11 +379,14 @@ public struct StorageCapacityBar: View {
                             .fill(Color(nsColor: .separatorColor).opacity(0.3))
                             .frame(width: geo.size.width)
                     } else {
-                        ForEach(partitions) { part in
-                            let ratio = max(0.08, CGFloat(part.totalSizeBytes) / CGFloat(max(1, totalBytes)))
+                        // Small partitions get a minimum share so they stay visible; shares are then
+                        // normalized so the segments always fill exactly the bar's width
+                        let shares = partitions.map { max(0.08, CGFloat($0.totalSizeBytes) / CGFloat(max(1, totalBytes))) }
+                        let totalShare = shares.reduce(0, +)
+                        ForEach(Array(partitions.enumerated()), id: \.element.id) { index, part in
                             Rectangle()
                                 .fill(colorForType(part.fileSystemType))
-                                .frame(width: geo.size.width * ratio)
+                                .frame(width: geo.size.width * shares[index] / totalShare)
                         }
                     }
                 }
@@ -392,6 +445,9 @@ public struct StorageCapacityBar: View {
         case .ntfs: return .blue
         case .btrfs: return .teal
         case .xfs: return .purple
+        case .zfs: return .indigo
+        case .f2fs: return .mint
+        case .udf: return .brown
         case .vfat, .exfat: return .green
         default: return Color(nsColor: .separatorColor)
         }
@@ -407,15 +463,18 @@ public struct VolumeRowView: View {
     let onUnmount: () -> Void
     let onReveal: () -> Void
     let onInspect: () -> Void
+    let onRepair: () -> Void
 
     public var body: some View {
         HStack(spacing: 14) {
             // Authentic Squircle Icon
+            // Symbol shows the physical device, color shows the filesystem
             AppleSettingsIcon(
-                systemName: partition.fileSystemType.iconName,
+                systemName: partition.driveKind.iconName,
                 color: iconColor(for: partition.fileSystemType),
                 size: 32
             )
+            .help(partition.deviceSummary)
 
             // Primary Information
             VStack(alignment: .leading, spacing: 3) {
@@ -427,6 +486,7 @@ public struct VolumeRowView: View {
                     Text(partition.bsdName)
                         .font(.system(size: 11, weight: .regular, design: .monospaced))
                         .foregroundStyle(.secondary)
+                        .fixedSize()
 
                     Text(partition.fileSystemType.description)
                         .font(.system(size: 10, weight: .semibold))
@@ -435,15 +495,18 @@ public struct VolumeRowView: View {
                         .padding(.vertical, 1.5)
                         .background(iconColor(for: partition.fileSystemType).opacity(0.12))
                         .clipShape(RoundedRectangle(cornerRadius: 4, style: .continuous))
+                        .fixedSize()
                 }
 
                 HStack(spacing: 8) {
                     Text(partition.formattedSize)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
+                        .fixedSize()
 
                     Text("•")
                         .foregroundStyle(.secondary)
+                        .fixedSize()
 
                     if partition.isMounted {
                         HStack(spacing: 4) {
@@ -453,7 +516,9 @@ public struct VolumeRowView: View {
                             Text(partition.isReadOnly ? "Read-Only" : "Mounted")
                                 .font(.system(size: 11, weight: .medium))
                                 .foregroundStyle(partition.isReadOnly ? Color.orange : Color.green)
+                                .fixedSize()
                         }
+                        .fixedSize()
 
                         if let mp = partition.mountPoint, !mp.isEmpty {
                             Text("at \(mp)")
@@ -465,6 +530,7 @@ public struct VolumeRowView: View {
                         Text("Not Mounted")
                             .font(.system(size: 11))
                             .foregroundStyle(.secondary)
+                            .fixedSize()
                     }
                 }
             }
@@ -474,14 +540,30 @@ public struct VolumeRowView: View {
             // Trailing Actions conforming strictly to Apple macOS HIG
             HStack(spacing: 8) {
                 if partition.isMounted {
+                    if partition.isReadOnly && partition.canOmniFSMountReadWrite {
+                        Button(action: onMountRW) {
+                            HStack(spacing: 4) {
+                                Image(systemName: "pencil")
+                                Text("Remount RW")
+                            }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.blue)
+                        .help("Remount volume in Read & Write mode via OmniFS")
+                    }
+
                     Button(action: onReveal) {
                         Image(systemName: "folder")
                     }
                     .buttonStyle(.bordered)
                     .help("Show in Finder")
 
-                    Button("Unmount", action: onUnmount)
-                        .buttonStyle(.bordered)
+                    Button(action: onUnmount) {
+                        Image(systemName: "eject")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Eject")
+                    .accessibilityLabel("Eject")
                 } else {
                     Menu {
                         Button(action: onMountRW) {
@@ -489,6 +571,12 @@ public struct VolumeRowView: View {
                         }
                         Button(action: onMountRO) {
                             Label("Mount Read-Only", systemImage: "lock")
+                        }
+                        if partition.supportsRepair {
+                            Divider()
+                            Button(action: onRepair) {
+                                Label("Check & Repair…", systemImage: "stethoscope")
+                            }
                         }
                     } label: {
                         Text("Mount")
@@ -502,8 +590,21 @@ public struct VolumeRowView: View {
                 .buttonStyle(.bordered)
                 .help("Get Info")
             }
+            // Buttons keep their full size; the volume details on the left truncate instead
+            .fixedSize()
         }
         .padding(.vertical, 4)
+        .contentShape(Rectangle())
+        .contextMenu {
+            if partition.supportsRepair {
+                Button(action: onRepair) {
+                    Label("Check & Repair…", systemImage: "stethoscope")
+                }
+            }
+            Button(action: onInspect) {
+                Label("Get Info", systemImage: "info.circle")
+            }
+        }
     }
 
     private func iconColor(for type: FileSystemType) -> Color {
@@ -512,6 +613,9 @@ public struct VolumeRowView: View {
         case .ntfs: return .blue
         case .btrfs: return .teal
         case .xfs: return .purple
+        case .zfs: return .indigo
+        case .f2fs: return .mint
+        case .udf: return .brown
         case .vfat, .exfat: return .green
         default: return .secondary
         }
@@ -529,7 +633,7 @@ public struct VolumeInspectorSheet: View {
         VStack(spacing: 0) {
             // Apple Sheet Header
             HStack {
-                AppleSettingsIcon(systemName: partition.fileSystemType.iconName, color: .blue, size: 30)
+                AppleSettingsIcon(systemName: partition.driveKind.iconName, color: .blue, size: 30)
                 VStack(alignment: .leading, spacing: 1) {
                     Text(partition.volumeName)
                         .font(.headline)
@@ -554,6 +658,13 @@ public struct VolumeInspectorSheet: View {
                     LabeledContent("Volume Name", value: partition.volumeName)
                     LabeledContent("File System", value: partition.fileSystemType.description)
                     LabeledContent("Capacity", value: partition.formattedSize)
+                    LabeledContent("Device Type", value: partition.driveKind.description)
+                    if let model = partition.deviceModel {
+                        LabeledContent("Device", value: model)
+                    }
+                    if let connection = partition.connection {
+                        LabeledContent("Connection", value: connection)
+                    }
 
                     if let uuid = partition.metadata?.uuid {
                         HStack {
@@ -642,39 +753,69 @@ public struct VolumeInspectorSheet: View {
 public struct FileSystemsSettingsView: View {
     public init() {}
 
+    private let vmInstalled = VMMountRegistry.helperExecutable() != nil && VMMountRegistry.vmAssetsDirectory() != nil
+
+    private func driverStatus(for type: FileSystemType) -> (text: String, color: Color) {
+        if vmInstalled {
+            return ("Read & Write via Linux VM", .green)
+        }
+        if type.isNativeReadableOnMacOS {
+            return ("Read-Only (macOS built-in)", .orange)
+        }
+        return ("Linux VM not installed", .secondary)
+    }
+
     public var body: some View {
         Form {
             Section {
                 FileSystemRow(
                     name: "ext2, ext3, ext4",
                     family: "Linux",
-                    description: "Full read and write support with journaling, 64-bit extents, and direct I/O.",
+                    description: "Mounted read & write by the Linux kernel ext4 driver, with journaling and extents.",
                     iconName: "externaldrive.badge.person.crop",
                     color: .orange,
-                    statusText: "Operational"
+                    status: driverStatus(for: .ext4)
                 )
 
                 FileSystemRow(
                     name: "Btrfs (B-tree File System)",
                     family: "Linux",
-                    description: "Copy-on-write Linux filesystem with snapshot and subvolume detection.",
+                    description: "Copy-on-write Linux filesystem, mounted by the Linux kernel Btrfs driver. Every subvolume and snapshot appears as a folder.",
                     iconName: "leaf.fill",
                     color: .teal,
-                    statusText: "Operational"
+                    status: driverStatus(for: .btrfs)
                 )
 
                 FileSystemRow(
                     name: "XFS",
                     family: "Linux",
-                    description: "High-performance 64-bit journaling filesystem with delayed allocation.",
+                    description: "64-bit journaling filesystem, mounted by the Linux kernel XFS driver.",
                     iconName: "square.stack.3d.up.fill",
                     color: .purple,
-                    statusText: "Operational"
+                    status: driverStatus(for: .xfs)
+                )
+
+                FileSystemRow(
+                    name: "ZFS (OpenZFS)",
+                    family: "Linux & Unix",
+                    description: "Pooled copy-on-write filesystem from Sun (Solaris, FreeBSD, TrueNAS, Linux). Imports the pool, mounts all datasets and exports it cleanly on eject. Encrypted datasets are not supported.",
+                    iconName: "square.stack.3d.down.right.fill",
+                    color: .indigo,
+                    status: driverStatus(for: .zfs)
+                )
+
+                FileSystemRow(
+                    name: "F2FS (Flash-Friendly File System)",
+                    family: "Linux",
+                    description: "Flash-optimized filesystem used by Android phones, SD cards and SSDs, mounted by the Linux kernel F2FS driver.",
+                    iconName: "sdcard.fill",
+                    color: .mint,
+                    status: driverStatus(for: .f2fs)
                 )
             } header: {
-                Text("Linux File Systems")
+                Text("Linux & Unix File Systems")
             } footer: {
-                Text("Native user-space drivers for Linux storage attached via USB, Thunderbolt, or raw disk images.")
+                Text("Linux volumes are served by a lightweight Linux VM (Apple Virtualization framework) and appear in Finder over a private NFS link. No kernel extensions or FUSE.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -683,15 +824,15 @@ public struct FileSystemsSettingsView: View {
                 FileSystemRow(
                     name: "NTFS (New Technology File System)",
                     family: "Windows",
-                    description: "Replaces macOS read-only limitation with native high-speed read and write capabilities.",
+                    description: "Read & write through the Linux kernel ntfs3 driver. Read-only mounts use the macOS built-in driver.",
                     iconName: "pc",
                     color: .blue,
-                    statusText: "Operational"
+                    status: driverStatus(for: .ntfs)
                 )
             } header: {
                 Text("Windows File Systems")
             } footer: {
-                Text("Provides transparent write caching and journal consistency for Windows disks.")
+                Text("Volumes left dirty by Windows hibernation, Fast Startup or a crash are refused read & write; use Check & Repair (right-click the volume), or shut Windows down fully.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -703,7 +844,16 @@ public struct FileSystemsSettingsView: View {
                     description: "Cross-platform storage natively monitored through macOS DiskArbitration.",
                     iconName: "externaldrive.fill",
                     color: .green,
-                    statusText: "System Built-in"
+                    status: ("System Built-in", .green)
+                )
+
+                FileSystemRow(
+                    name: "UDF (Universal Disk Format)",
+                    family: "Universal",
+                    description: "Optical-disc format also used on some USB drives and cameras. Read-only uses the macOS built-in driver; read & write (UDF up to 2.01) the Linux kernel UDF driver.",
+                    iconName: "opticaldisc.fill",
+                    color: .brown,
+                    status: driverStatus(for: .udf)
                 )
             } header: {
                 Text("Universal Storage")
@@ -719,7 +869,7 @@ private struct FileSystemRow: View {
     let description: String
     let iconName: String
     let color: Color
-    let statusText: String
+    let status: (text: String, color: Color)
 
     var body: some View {
         HStack(alignment: .top, spacing: 14) {
@@ -732,9 +882,9 @@ private struct FileSystemRow: View {
                     Spacer()
                     HStack(spacing: 5) {
                         Circle()
-                            .fill(Color.green)
+                            .fill(status.color)
                             .frame(width: 6, height: 6)
-                        Text(statusText)
+                        Text(status.text)
                             .font(.system(size: 11, weight: .medium))
                             .foregroundStyle(.secondary)
                     }
@@ -872,7 +1022,7 @@ public struct AboutOmniFSView: View {
             Section("Specifications") {
                 LabeledContent("Operating System", value: "macOS 15 Sequoia (Darwin 27)")
                 LabeledContent("Architecture", value: "Apple Silicon (ARM64 Native)")
-                LabeledContent("Execution Model", value: "User-Space POSIX VFS")
+                LabeledContent("Execution Model", value: "Linux VM (Virtualization.framework) + NFS")
                 LabeledContent("Kernel Extensions", value: "None (Zero-Kext)")
                 LabeledContent("License", value: "MIT Open Source")
             }
@@ -905,14 +1055,14 @@ public struct AboutOmniFSView: View {
         === OmniFS System Diagnostics ===
         Timestamp: \(Date())
         Version: 1.0 (Build 2026.10)
-        OS: macOS Darwin 27 (macOS 15+)
+        OS: \(ProcessInfo.processInfo.operatingSystemVersionString)
         Architecture: Apple Silicon arm64
-        Supported Engines:
-          - ext2 / ext3 / ext4: Active
-          - Btrfs: Active
-          - XFS: Active
-          - NTFS: Active (Read-Write)
-          - exFAT / FAT32: Native
+        Drivers:
+          - Linux VM helper: \(VMMountRegistry.helperExecutable()?.path ?? "not installed")
+          - Linux VM image: \(VMMountRegistry.vmAssetsDirectory()?.path ?? "not installed")
+          - ext2 / ext3 / ext4, Btrfs, XFS, ZFS: Linux VM
+          - NTFS: Linux VM (read-write), macOS built-in (read-only)
+          - exFAT / FAT32: macOS built-in
         =================================
         """
         NSPasteboard.general.clearContents()

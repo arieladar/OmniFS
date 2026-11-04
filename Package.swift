@@ -1,4 +1,4 @@
-// swift-tools-version: 6.4
+// swift-tools-version: 6.0
 import PackageDescription
 
 let package = Package(
@@ -11,6 +11,7 @@ let package = Package(
         .library(name: "OmniFSPrefPane", type: .dynamic, targets: ["OmniFSPrefPane"]),
         .executable(name: "omnifs", targets: ["OmniFSCLI"]),
         .executable(name: "OmniFSSettings", targets: ["OmniFSSettings"]),
+        .executable(name: "omnifs-vmd", targets: ["OmniFSVMHelper"]),
     ],
     dependencies: [],
     targets: [
@@ -37,6 +38,14 @@ let package = Package(
             name: "OmniFSSettings",
             dependencies: ["OmniFSCore"],
             path: "Sources/OmniFSSettings"
+        ),
+        .executableTarget(
+            name: "OmniFSVMHelper",
+            dependencies: ["OmniFSCore"],
+            path: "Sources/OmniFSVMHelper",
+            linkerSettings: [
+                .linkedFramework("Virtualization")
+            ]
         ),
         .testTarget(
             name: "OmniFSTests",

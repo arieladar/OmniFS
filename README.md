@@ -1,24 +1,39 @@
-# OmniFS 🚀
-### Universal Filesystem Engine & Settings Interface for macOS on Apple Silicon
+# OmniFS
+### Read & write Linux, Windows and Unix filesystems on macOS (Apple Silicon)
 
-OmniFS brings true **Read & Write** capabilities to macOS for foreign filesystems across Linux and Windows:
+OmniFS mounts foreign filesystems **read & write** on macOS, with no kernel extensions, no FUSE and no
+reduced system security:
 
-* **Linux**: `ext2`, `ext3`, `ext4` (with journaling and extents), `Btrfs`, and `XFS`.
-* **Windows**: `NTFS` (full read & write, eliminating macOS's native read-only barrier).
-* **Universal**: `exFAT` and `FAT32` (VFAT) with automatic volume detection and management.
+* **Windows**: `NTFS` (macOS itself only reads NTFS)
+* **Linux**: `ext2`, `ext3`, `ext4`, `Btrfs` (every subvolume and snapshot appears as a folder), `XFS`
+* **Linux & Unix**: `ZFS` (OpenZFS pools from Linux, FreeBSD, TrueNAS, illumos/Solaris; all datasets)
+* **Universal**: `exFAT` and `FAT32` are handed to macOS's own drivers
 
-Designed natively for Apple Silicon (ARM64) and modern macOS (macOS 15+ / Darwin 27).
+Requires macOS 15+ on Apple Silicon.
 
 ---
 
-## Key Features
+## How it works
 
-1. **Native Apple Silicon**: Built in Swift 6.4 specifically for Apple M-series chips.
-2. **System Settings Interface**: Designed faithfully using SwiftUI and `NavigationSplitView` matching the look, sidebar, and layout of macOS System Settings.
-3. **Pure User-Space Architecture**: Eliminates legacy Kernel Extensions (`.kext`) and avoids requiring users to reduce system security in Recovery Mode.
-4. **Superblock Sniffer**: Fast byte-level parser capable of identifying raw filesystem superblocks (magic offsets, UUIDs, volume labels, block sizes, clean/dirty states) from block devices and raw disk images.
-5. **DiskArbitration Integration**: Automatic detection of connected external USB drives, SD cards, and partitions.
-6. **Automation CLI (`omnifs`)**: Full command-line support for scriptable mounting, unmounting, inspection, and background auto-mounting.
+macOS has no drivers for these filesystems, and third-party drivers would need kernel extensions, FUSE or
+an FSKit module (FSKit requires a paid Apple Developer Program membership). OmniFS instead uses the
+filesystem drivers of the Linux kernel itself:
+
+1. `omnifs-vmd` opens the partition (one macOS authorization dialog, through `authopen`) and boots a tiny
+   Alpine Linux VM (Linux 6.18 LTS, Apple Virtualization framework) with the partition attached.
+2. The guest mounts it with the kernel driver (`ntfs3`, `ext4`, `btrfs`, `xfs`, OpenZFS) and shares it
+   over NFS on a private virtual network.
+3. macOS mounts that share. The volume appears in Finder under its own name. Ejecting it shuts the guest
+   down cleanly (`umount`, `zpool export`) before the drive is released.
+
+The same VM runs each filesystem's own checker for **Check & Repair** (`e2fsck`, `ntfsfix`, `xfs_repair`,
+`btrfs check`, `zpool scrub`).
+
+Known limitations:
+* macOS gives network-style volumes no Trash; delete with ⌥⌘⌫ (Delete Immediately).
+* macOS writes `._` files next to files with extended attributes.
+* NTFS volumes left dirty by Windows (hibernation / Fast Startup) are refused read & write until checked;
+  encrypted ZFS datasets are not supported.
 
 ---
 
@@ -27,22 +42,14 @@ Designed natively for Apple Silicon (ARM64) and modern macOS (macOS 15+ / Darwin
 ```
 OmniFS/
 ├── Sources/
-│   ├── OmniFSCore/          # Core filesystem sniffer, disk scanner, mount manager
-│   │   ├── FileSystemType.swift
-│   │   ├── SuperblockMetadata.swift
-│   │   ├── SuperblockSniffer.swift
-│   │   ├── DiskPartition.swift
-│   │   ├── DiskScanner.swift
-│   │   ├── MountOptions.swift
-│   │   ├── MountManager.swift
-│   │   └── AutoMountService.swift
-│   ├── OmniFSCLI/           # 'omnifs' command-line executable
-│   │   └── main.swift
-│   └── OmniFSSettings/      # System Settings style SwiftUI interface
-│       └── main.swift
-├── Tests/
-│   └── OmniFSTests/         # Superblock parsers & unit test suite
-└── Package.swift
+│   ├── OmniFSCore/          # Detection (superblock sniffer, disk scanner), MountManager, VM state, SwiftUI views
+│   ├── OmniFSVMHelper/      # omnifs-vmd: boots the Linux guest for one partition
+│   ├── OmniFSCLI/           # omnifs command-line tool
+│   ├── OmniFSSettings/      # Standalone settings app
+│   └── OmniFSPrefPane/      # System Settings pane
+├── Resources/vm/            # Guest init script, helper entitlements
+├── scripts/build_vm_image.py  # Builds the guest kernel + initramfs from Alpine packages (no Docker)
+└── Tests/OmniFSTests/       # Unit tests + opt-in integration tests on real disk images
 ```
 
 ---
@@ -50,66 +57,45 @@ OmniFS/
 ## CLI Usage (`omnifs`)
 
 ```bash
-# List all disks, partitions, and detected Linux/Windows filesystems
-swift run omnifs list
-
-# Mount a partition in Read-Write mode
-swift run omnifs mount disk3s1 --rw
-
-# Mount a partition in Read-Only mode
-swift run omnifs mount disk3s1 --ro
-
-# Unmount a partition or mount point
-swift run omnifs unmount /Volumes/LinuxData
-
-# Deep inspect a block device or raw image superblock
-swift run omnifs inspect /dev/disk3s1
+omnifs list                          # Disks, partitions, filesystems and devices
+omnifs mount disk4s1 --rw            # Mount read & write (or --ro)
+omnifs mount disk4s1 --rw --mountpoint ~/mnt/data
+omnifs unmount disk4s1               # Or the mount point
+omnifs repair disk4s1                # Check & Repair (unmounted during the check, then remounted)
+omnifs inspect /dev/rdisk4s1         # Dump superblock metadata of a device or image
 ```
 
 ---
 
-## Installation & Packaging
-
-### Option 1: Build & Mount the Signed DMG (Recommended)
-Generate the complete macOS distribution disk image:
+## Building & Installing
 
 ```bash
-./build_dmg.sh
+./install.sh         # Builds everything (including the VM image), installs the pane, app and CLI
+./build_dmg.sh       # Builds a distributable OmniFS.dmg
 ```
 
-This compiles release binaries, signs all bundles, and generates `OmniFS.dmg` containing:
-* `OmniFS.prefPane` (macOS System Settings pane)
-* `OmniFS.app` (Standalone Settings app)
-* `Applications` drag-and-drop symlink
-* `Install OmniFS.command` (one-click installer script)
-
-To install, simply open `OmniFS.dmg` and double-click **Install OmniFS.command** (or drag `OmniFS.prefPane` into `~/Library/PreferencePanes/`).
-
-### Option 2: Quick Script Install
-Install directly from the repository into your user profile and launch System Settings:
+The VM image is built by `scripts/build_vm_image.py` into `.build/vm`. After a plain `swift build`, sign the
+development helper so it may use the Virtualization framework:
 
 ```bash
-./install.sh
-```
-
-### Option 3: Launch in Development Mode
-
-```bash
-swift run OmniFSSettings
+codesign -s - -f --entitlements Resources/vm/omnifs-vmd.entitlements .build/debug/omnifs-vmd
 ```
 
 ---
 
 ## Testing
 
-Run the test suite:
-
 ```bash
-swift test
+swift test                                                         # Unit tests
+OMNIFS_INTEGRATION=1 swift test --filter VolumeIntegrationTests    # Real disks through the VM (several minutes)
 ```
+
+The integration tests create NTFS, ext2/3/4, Btrfs, XFS and ZFS disk images, attach them as devices and check
+detection, copying in and out, moving, renaming, deleting, persistence, read-only mounts, eject, Btrfs
+subvolumes, ZFS datasets and Check & Repair (including an NTFS volume left dirty by a crash).
 
 ---
 
 ## License
 
-MIT License. See [LICENSE](file:///Users/arieladar/.gemini/antigravity-ide/scratch/OmniFS/LICENSE) for details.
+MIT License. See [LICENSE](LICENSE) for details.

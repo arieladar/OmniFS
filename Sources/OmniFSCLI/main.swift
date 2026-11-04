@@ -17,6 +17,8 @@ struct OmniFSCLI {
             await handleList()
         case "mount":
             await handleMount(args: Array(args.dropFirst(2)))
+        case "repair", "fsck":
+            await handleRepair(args: Array(args.dropFirst(2)))
         case "unmount", "umount":
             await handleUnmount(args: Array(args.dropFirst(2)))
         case "inspect":
@@ -37,14 +39,16 @@ struct OmniFSCLI {
 
         Commands:
           list               List all disks, partitions, and detected filesystems
-          mount <disk>       Mount partition (e.g. disk3s1) [--ro | --rw]
+          mount <disk>       Mount partition (e.g. disk3s1) [--ro | --rw] [--mountpoint <dir>]
           unmount <target>   Unmount partition or mount point
+          repair <disk>      Check & repair a partition (unmounted during the check, then remounted)
           inspect <devPath>  Dump superblock metadata for a block device or raw image
           help               Show this help message
 
         Supported Filesystems:
-          • Linux:   ext2, ext3, ext4, Btrfs, XFS
+          • Linux:   ext2, ext3, ext4, Btrfs, XFS, ZFS
           • Windows: NTFS (Read & Write)
+          (Linux filesystems and NTFS read & write run in the OmniFS Linux VM)
           • Universal: exFAT, FAT32/VFAT
         """)
     }
@@ -72,6 +76,7 @@ struct OmniFSCLI {
             let mountedStr = p.isMounted ? "Yes (\(p.isReadOnly ? "RO" : "RW"))" : "No"
             let fsStr = p.fileSystemType.description
             print("\(pad(p.bsdName, 12)) \(pad(fsStr, 16)) \(pad(p.formattedSize, 10)) \(pad(mountedStr, 12)) \(pad(p.volumeName, 20))")
+            print("   ↳ Device: \(p.deviceSummary)")
             if let mp = p.mountPoint, !mp.isEmpty {
                 print("   ↳ Mount Point: \(mp)")
             }
@@ -96,7 +101,10 @@ struct OmniFSCLI {
         }
 
         print("Mounting \(partition.bsdName) [\(partition.fileSystemType)] in \(isReadOnly ? "Read-Only" : "Read-Write") mode...")
-        let options = MountOptions(isReadOnly: isReadOnly)
+        var options = MountOptions(isReadOnly: isReadOnly)
+        if let index = args.firstIndex(of: "--mountpoint"), index + 1 < args.count {
+            options.customMountPoint = args[index + 1]
+        }
         do {
             let result = try await MountManager.shared.mount(partition: partition, options: options)
             if result.success {
@@ -106,6 +114,26 @@ struct OmniFSCLI {
             }
         } catch {
             print("✗ Mount error: \(error)")
+        }
+    }
+
+    static func handleRepair(args: [String]) async {
+        guard let bsdName = args.first else {
+            print("Error: Missing disk identifier (e.g. omnifs repair disk3s1)")
+            return
+        }
+        guard let partition = await DiskScanner().inspectDisk(bsdName: bsdName) else {
+            print("Error: Could not locate partition '\(bsdName)'")
+            return
+        }
+        print("Checking \(partition.bsdName) [\(partition.fileSystemType)]... don't disconnect the drive.")
+        do {
+            let result = try await MountManager.shared.repair(partition: partition)
+            print(result.success ? "✓ \(result.message)" : "✗ \(result.message)")
+            if !result.success { exit(1) }
+        } catch {
+            print("✗ Repair error: \(error)")
+            exit(1)
         }
     }
 

@@ -47,11 +47,16 @@ public actor AutoMountService {
         let partitions = await scanner.scanPartitions()
 
         for partition in partitions {
-            // If it's a supported foreign filesystem that isn't already mounted
-            if partition.fileSystemType.requiresOmniFSDriver && !partition.isMounted {
+            // Only macOS's own read-only mounts are upgraded; a volume the user mounted read-only through OmniFS stays so
+            let servedByVM = VMMountRegistry.activeRecord(bsdName: partition.bsdName) != nil
+            let needsRemountToRW = !config.mountReadOnly && partition.isMounted && partition.isReadOnly && !servedByVM && partition.fileSystemType.requiresOmniFSDriver
+            let needsInitialMount = !partition.isMounted && partition.fileSystemType.requiresOmniFSDriver
+
+            if needsInitialMount || needsRemountToRW {
+                // The default /Volumes location is chosen by MountManager / DiskArbitration
                 let options = MountOptions(
                     isReadOnly: config.mountReadOnly,
-                    customMountPoint: "\(config.baseMountDirectory)/\(partition.volumeName)"
+                    customMountPoint: config.baseMountDirectory == "/Volumes" ? nil : "\(config.baseMountDirectory)/\(partition.volumeName)"
                 )
                 if let result = try? await mountManager.mount(partition: partition, options: options) {
                     results.append(result)

@@ -12,14 +12,23 @@ echo "=================================================="
 echo "[1/6] Compiling release binaries..."
 swift build -c release
 
+# Linux VM guest (kernel + initramfs) used for NTFS / ext2-4 / Btrfs / XFS / ZFS read & write
+if [ ! -f "$DIR/.build/vm/Image" ] || [ "$DIR/Resources/vm/init" -nt "$DIR/.build/vm/initramfs.cpio.gz" ] \
+   || [ "$DIR/scripts/build_vm_image.py" -nt "$DIR/.build/vm/initramfs.cpio.gz" ]; then
+    python3 -I "$DIR/scripts/build_vm_image.py" "$DIR/.build/vm"
+fi
+
 # 2. Package OmniFS.prefPane
 echo "[2/6] Packaging OmniFS.prefPane bundle..."
 mkdir -p "$DIR/OmniFS.prefPane/Contents/MacOS"
 mkdir -p "$DIR/OmniFS.prefPane/Contents/Resources"
 cp "$DIR/.build/release/libOmniFSPrefPane.dylib" "$DIR/OmniFS.prefPane/Contents/MacOS/OmniFS"
 chmod +x "$DIR/OmniFS.prefPane/Contents/MacOS/OmniFS"
+cp "$DIR/Resources/Info-PrefPane.plist" "$DIR/OmniFS.prefPane/Contents/Info.plist"
 cp "$DIR/Resources/AppIcon.icns" "$DIR/OmniFS.prefPane/Contents/Resources/OmniFS.icns"
 cp "$DIR/Resources/AppIcon_1024.png" "$DIR/OmniFS.prefPane/Contents/Resources/AppIcon.png"
+cp "$DIR/.build/release/omnifs-vmd" "$DIR/OmniFS.prefPane/Contents/MacOS/omnifs-vmd"
+rm -rf "$DIR/OmniFS.prefPane/Contents/Resources/vm" && cp -R "$DIR/.build/vm" "$DIR/OmniFS.prefPane/Contents/Resources/vm"
 
 # 3. Package OmniFS.app
 echo "[3/6] Packaging OmniFS.app bundle..."
@@ -27,13 +36,19 @@ mkdir -p "$DIR/OmniFS.app/Contents/MacOS"
 mkdir -p "$DIR/OmniFS.app/Contents/Resources"
 cp "$DIR/.build/release/OmniFSSettings" "$DIR/OmniFS.app/Contents/MacOS/OmniFSSettings"
 chmod +x "$DIR/OmniFS.app/Contents/MacOS/OmniFSSettings"
+cp "$DIR/Resources/Info-App.plist" "$DIR/OmniFS.app/Contents/Info.plist"
 cp "$DIR/Resources/AppIcon.icns" "$DIR/OmniFS.app/Contents/Resources/AppIcon.icns"
 cp "$DIR/Resources/AppIcon_1024.png" "$DIR/OmniFS.app/Contents/Resources/AppIcon.png"
+cp "$DIR/.build/release/omnifs-vmd" "$DIR/OmniFS.app/Contents/MacOS/omnifs-vmd"
+rm -rf "$DIR/OmniFS.app/Contents/Resources/vm" && cp -R "$DIR/.build/vm" "$DIR/OmniFS.app/Contents/Resources/vm"
 
 # 4. Code sign all bundles and binaries (ad-hoc signing with hardened verification)
 echo "[4/6] Code-signing bundles..."
-codesign --force --deep -s - "$DIR/OmniFS.app"
-codesign --force --deep -s - "$DIR/OmniFS.prefPane"
+ENTITLEMENTS="$DIR/Resources/vm/omnifs-vmd.entitlements"
+codesign --force -s - --entitlements "$ENTITLEMENTS" "$DIR/OmniFS.app/Contents/MacOS/omnifs-vmd"
+codesign --force -s - --entitlements "$ENTITLEMENTS" "$DIR/OmniFS.prefPane/Contents/MacOS/omnifs-vmd"
+codesign --force -s - "$DIR/OmniFS.app"
+codesign --force -s - "$DIR/OmniFS.prefPane"
 codesign --verify --deep --strict "$DIR/OmniFS.app"
 codesign --verify --deep --strict "$DIR/OmniFS.prefPane"
 
@@ -63,7 +78,7 @@ echo "          OmniFS for macOS — System Installation"
 echo "================================================================"
 echo ""
 echo "OmniFS provides universal read & write filesystem drivers"
-echo "for Linux (ext2/3/4, Btrfs, XFS) and Windows (NTFS) storage."
+echo "for Linux (ext2/3/4, Btrfs, XFS), ZFS and Windows (NTFS) storage."
 echo ""
 echo "Installation scope recommendation:"
 echo "----------------------------------------------------------------"
@@ -132,7 +147,7 @@ OmniFS for macOS — Universal Filesystem Engine
 RECOMMENDED INSTALLATION (For All Users):
 -----------------------------------------
 It is recommended to install OmniFS for ALL users so that foreign
-storage drives (Linux ext4/Btrfs/XFS and Windows NTFS) are recognized
+storage drives (Linux ext2/3/4, Btrfs, XFS, ZFS and Windows NTFS) are recognized
 system-wide across all user accounts on this Mac.
 
 Choose one of the following methods:

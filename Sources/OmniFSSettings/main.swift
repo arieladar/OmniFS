@@ -8,7 +8,6 @@ struct OmniFSSettingsApp: App {
             SettingsContainerView()
         }
         .windowResizability(.contentSize)
-        .defaultSize(width: 380, height: 520)
+        .defaultSize(width: 680, height: 560)
     }
 }
-
