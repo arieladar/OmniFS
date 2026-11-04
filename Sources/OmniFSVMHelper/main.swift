@@ -173,6 +173,11 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
 
             let network = VZVirtioNetworkDeviceConfiguration()
             network.attachment = VZNATNetworkDeviceAttachment()
+            // Recovery aid: reusing a previous VM's MAC address gets its IP back from the NAT's DHCP, so NFS requests
+            // a Mac process is still waiting on can complete
+            if let mac = ProcessInfo.processInfo.environment["OMNIFS_MAC"].flatMap(VZMACAddress.init(string:)) {
+                network.macAddress = mac
+            }
             config.networkDevices = [network]
 
             let console = VZVirtioConsoleDeviceSerialPortConfiguration()
