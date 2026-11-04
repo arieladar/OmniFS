@@ -1,0 +1,228 @@
+#!/bin/busybox sh
+# OmniFS guest init: mounts the attached partition (/dev/vda) with the Linux kernel driver
+# and exports it to macOS over NFSv3, or checks and repairs it. Talks to omnifs-vmd over the console (hvc0):
+#   guest -> host: OMNIFS_WANT_NAME | OMNIFS_READY ip=<addr> export=<path> | OMNIFS_REPAIRED <summary>
+#                  | OMNIFS_ERROR <message> | OMNIFS_STOPPED
+#   host -> guest: <volume name> (answering OMNIFS_WANT_NAME), then "shutdown"
+# Kernel command line: omnifs.fs=<ntfs|ext2|ext3|ext4|btrfs|xfs|zfs|f2fs|udf> omnifs.ro=<0|1>
+#                      omnifs.action=<mount|repair> omnifs.mkfs=<0|1> (test images only)
+
+/bin/busybox --install -s
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mount -t devtmpfs dev /dev
+mount -t tmpfs tmp /run
+ln -sfn /run /var/run
+depmod -a
+exec </dev/console >/dev/console 2>&1
+
+fail() {
+    echo "OMNIFS_ERROR $*"
+    sync
+    poweroff -f
+}
+
+load() { modprobe -q "$@"; }
+
+arg() { tr ' ' '\n' </proc/cmdline | sed -n "s/^omnifs\.$1=//p"; }
+[ "$(arg debug)" = "1" ] && set -x
+FS=$(arg fs)
+RO=$(arg ro)
+ACTION=$(arg action)
+
+load virtio_blk
+load virtio_net
+load virtio-rng
+load af_packet
+
+# Wait for the partition and network device to appear
+for i in $(seq 50); do
+    [ -b /dev/vda ] && [ -e /sys/class/net/eth0 ] && break
+    sleep 0.1
+done
+[ -b /dev/vda ] || fail "partition device did not appear"
+
+# ZFS keeps its cache in guest RAM; cap it well below the VM's 1 GB
+load_zfs() { load zfs zfs_arc_max=268435456 || fail "the ZFS kernel module could not be loaded"; }
+
+# Imports the pool on /dev/vda with its datasets under /zfs; sets POOL
+import_zfs_pool() {
+    load_zfs
+    POOL=$(zpool import -d /dev 2>/dev/null | sed -n 's/^ *pool: //p' | head -1)
+    [ -n "$POOL" ] || fail "no importable ZFS pool found on this partition"
+    set -- -d /dev -N -R /zfs
+    [ "$RO" = "1" ] && set -- "$@" -o readonly=on
+    if ! err=$(zpool import "$@" "$POOL" 2>&1); then
+        # Pools moved from another computer without "zpool export" look in use; the disk is physically here
+        case "$err" in
+            *"another system"*) err=$(zpool import -f "$@" "$POOL" 2>&1) || fail "ZFS import failed: $err" ;;
+            *) fail "ZFS import failed: $err" ;;
+        esac
+    fi
+}
+
+# Test images only: omnifs-vmd refuses --format for real devices. Btrfs and ZFS test volumes also get a
+# subvolume / child dataset so tests can verify they are reachable.
+if [ "$(arg mkfs)" = "1" ]; then
+    mkdir -p /run/fmt
+    case "$FS" in
+        ext2|ext3|ext4) mke2fs -q -F -t "$FS" -L OMNIFS /dev/vda ;;
+        ntfs) mkntfs -Q -F -q -L OMNIFS /dev/vda ;;
+        xfs) mkfs.xfs -q -f -L OMNIFS /dev/vda ;;
+        f2fs) mkfs.f2fs -q -f -l OMNIFS /dev/vda >/dev/null ;;
+        udf) mkudffs --media-type=hd --label=OMNIFS /dev/vda >/dev/null ;;
+        btrfs)
+            load btrfs
+            mkfs.btrfs -q -f -L OMNIFS /dev/vda && mount -t btrfs /dev/vda /run/fmt \
+                && btrfs subvolume create /run/fmt/@home >/dev/null \
+                && echo "inside a subvolume" >/run/fmt/@home/subvolume.txt && umount /run/fmt ;;
+        zfs)
+            load_zfs
+            zpool create -f -O mountpoint=/OMNIFS OMNIFS /dev/vda && zfs create OMNIFS/child \
+                && echo "inside a child dataset" >/OMNIFS/child/dataset.txt && zpool export OMNIFS ;;
+        *) false ;;
+    esac || fail "cannot format $FS"
+fi
+
+# ----- Check & repair -----
+if [ "$ACTION" = "repair" ]; then
+    echo "OMNIFS_LOG checking $FS volume"
+    case "$FS" in
+        ext2|ext3|ext4)
+            e2fsck -f -y /dev/vda
+            rc=$?
+            case $rc in
+                0) SUMMARY="No problems found." ;;
+                1|2|3) SUMMARY="Problems were found and repaired." ;;
+                *) fail "Problems remain that could not be repaired (e2fsck exit code $rc)." ;;
+            esac ;;
+        ntfs)
+            ntfsfix -d /dev/vda || fail "ntfsfix could not repair this NTFS volume. Run chkdsk on Windows."
+            SUMMARY="Basic NTFS repairs done and the volume marked clean. For a full check, run chkdsk on Windows." ;;
+        xfs)
+            xfs_repair /dev/vda
+            rc=$?
+            if [ $rc -eq 2 ]; then
+                # The log must be replayed before repair; mounting does that
+                load xfs
+                mkdir -p /run/replay && mount -t xfs /dev/vda /run/replay && umount /run/replay
+                xfs_repair /dev/vda
+                rc=$?
+            fi
+            [ $rc -eq 0 ] || fail "xfs_repair could not repair this volume (exit code $rc)."
+            SUMMARY="XFS check and repair completed; no problems remain." ;;
+        f2fs)
+            fsck.f2fs -f -y /dev/vda || fail "fsck.f2fs could not repair this volume."
+            SUMMARY="F2FS check and repair completed; no problems remain." ;;
+        btrfs)
+            btrfs check --readonly /dev/vda || fail "Btrfs check found errors. Automatic Btrfs repair can lose data; mount the volume read-only to copy your files off, then use 'btrfs rescue' on Linux."
+            SUMMARY="No problems found." ;;
+        zfs)
+            RO=0
+            import_zfs_pool
+            zpool scrub -w "$POOL" || { zpool export "$POOL"; fail "the ZFS scrub could not run"; }
+            STATUS=$(zpool status -x "$POOL")
+            echo "$STATUS"
+            zpool export "$POOL"
+            case "$STATUS" in
+                *"is healthy"*) SUMMARY="Scrub completed; the pool is healthy." ;;
+                *) fail "Scrub completed but the pool reports problems: $(echo "$STATUS" | sed -n 's/^ *status: //p')" ;;
+            esac ;;
+        *) fail "repair is not supported for '$FS'" ;;
+    esac
+    sync
+    echo "OMNIFS_REPAIRED $SUMMARY"
+    poweroff -f
+fi
+
+# ----- Mount and export -----
+
+# Finder names NFS volumes after the export path, so export under the volume's name (sent by omnifs-vmd)
+echo "OMNIFS_WANT_NAME"
+read -r VOLNAME
+VOLNAME=$(echo "$VOLNAME" | tr -d '/"')
+[ -n "$VOLNAME" ] || VOLNAME=volume
+EXPORT="/exports/$VOLNAME"
+mkdir -p "$EXPORT"
+[ "$RO" = "1" ] && MODE=ro || MODE=rw
+
+case "$FS" in
+    ext2|ext3|ext4) load ext4; TYPE=ext4; OPTS="$MODE" ;;
+    ntfs) load ntfs3; TYPE=ntfs3; OPTS="$MODE,windows_names,iocharset=utf8" ;;
+    # The top level (subvolid 5) shows every subvolume and snapshot as a folder
+    btrfs) load btrfs; TYPE=btrfs; OPTS="$MODE,subvolid=5" ;;
+    xfs) load xfs; TYPE=xfs; OPTS="$MODE" ;;
+    f2fs) load f2fs; TYPE=f2fs; OPTS="$MODE" ;;
+    # Linux writes UDF up to revision 2.01; newer revisions are mounted read-only by the kernel
+    udf) load udf; TYPE=udf; OPTS="$MODE,utf8" ;;
+    zfs) TYPE=zfs ;;
+    *) fail "unsupported filesystem '$FS'" ;;
+esac
+
+if [ "$TYPE" = "zfs" ]; then
+    import_zfs_pool
+    zfs mount -a || fail "could not mount the datasets of ZFS pool $POOL (encrypted datasets are not supported)"
+    # Present the root dataset (or, if it is not mountable, everything under the pool) at the export path
+    SRC=/zfs
+    [ "$(zfs get -H -o value mounted "$POOL")" = "yes" ] && SRC=$(zfs get -H -o value mountpoint "$POOL")
+    mount -o rbind "$SRC" "$EXPORT" || fail "could not present ZFS pool $POOL"
+elif ! err=$(mount -t "$TYPE" -o "$OPTS" /dev/vda "$EXPORT" 2>&1); then
+    if [ "$TYPE" = "ntfs3" ]; then
+        fail "NTFS volume is marked dirty or in use by Windows (hibernation / Fast Startup). Use Check & Repair, or shut Windows down fully, then try again. ($err)"
+    fi
+    fail "mount failed: $err"
+fi
+
+# Network (Virtualization.framework NAT provides DHCP)
+ip link set lo up
+ip link set eth0 up
+cat >/run/udhcpc.sh <<'EOF'
+#!/bin/sh
+[ "$1" = bound ] || [ "$1" = renew ] || exit 0
+ip addr flush dev "$interface"
+ip addr add "$ip/${mask:-24}" dev "$interface"
+EOF
+chmod +x /run/udhcpc.sh
+udhcpc -i eth0 -s /run/udhcpc.sh -q -n -t 20 >/dev/null 2>&1 || fail "network configuration failed"
+IP=$(ip -4 -o addr show eth0 | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p')
+
+# NFSv3 server; all clients act as root inside the guest so the macOS user can read and write everything.
+# Filesystems mounted below the export (ZFS child datasets) are exported too, each with its own fsid.
+load nfsd
+mount -t nfsd nfsd /proc/fs/nfsd || fail "nfsd unavailable"
+OPTIONS="rw,insecure,no_subtree_check,all_squash,anonuid=0,anongid=0"
+echo "\"$EXPORT\" *($OPTIONS,fsid=1)" >/etc/exports
+FSID=1
+awk '{print $2}' /proc/mounts | while read -r mp; do
+    mp=$(printf '%b' "$(echo "$mp" | sed 's/\\\([0-7]\{3\}\)/\\0\1/g')")
+    case "$mp" in
+        "$EXPORT"/*) FSID=$((FSID + 1)); echo "\"$mp\" *($OPTIONS,nohide,fsid=$FSID)" >>/etc/exports ;;
+    esac
+done
+rpcbind -w || fail "rpcbind failed"
+exportfs -ra || fail "exportfs failed"
+rpc.mountd -p 20048 || fail "rpc.mountd failed"
+rpc.nfsd -p 2049 -N 4 8 || fail "rpc.nfsd failed"
+
+echo "OMNIFS_READY ip=$IP export=$EXPORT"
+
+while read -r cmd; do
+    [ "$cmd" = shutdown ] && break
+done
+
+exportfs -ua
+rpc.nfsd 0
+sync
+if [ "$TYPE" = "zfs" ]; then
+    # Lazy unmount detaches the whole rbind tree at once (busybox umount has no -R)
+    umount -l "$EXPORT"
+    # Export so the pool imports cleanly on any other system
+    zpool export "$POOL" || zpool export -f "$POOL"
+else
+    umount "$EXPORT" || umount -l "$EXPORT"
+fi
+sync
+echo "OMNIFS_STOPPED"
+poweroff -f

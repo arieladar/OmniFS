@@ -11,6 +11,8 @@ public actor DiskScanner {
     /// inspecting foreign partitions with SuperblockSniffer.
     public func scanPartitions() async -> [DiskPartition] {
         var results: [DiskPartition] = []
+        // BSD names are reused when drives are swapped, so drive details are only cached within one scan
+        wholeDiskCache.removeAll()
 
         // Run diskutil info -all or parse plist to query the system
         let process = Process()
@@ -91,13 +93,31 @@ public actor DiskScanner {
             ?? 0
 
         var volumeName = (infoDict["VolumeName"] as? String) ?? ""
-        let mountPoint = infoDict["MountPoint"] as? String
-        let isReadOnly = (infoDict["Writable"] as? Bool == false)
+        var mountPoint = infoDict["MountPoint"] as? String
+        var isReadOnly = (infoDict["Writable"] as? Bool == false)
+
+        // Volumes served by the OmniFS Linux VM are unknown to diskutil
+        if let vmMount = VMMountRegistry.activeRecord(bsdName: bsdName), VMMountRegistry.isMountPoint(vmMount.mountPoint) {
+            mountPoint = vmMount.mountPoint
+            isReadOnly = vmMount.readOnly
+        }
 
         // Sniff the superblock to identify foreign filesystems (ext2/3/4, NTFS, Btrfs, XFS)
-        var meta = sniffer.probe(devicePath: rawPath)
-        if meta == nil {
+        // Only touch devices this user may read: opening others fails anyway and triggers a macOS privacy prompt
+        var meta: SuperblockMetadata?
+        if access(rawPath, R_OK) == 0 {
+            meta = sniffer.probe(devicePath: rawPath)
+        }
+        if meta == nil && access(devicePath, R_OK) == 0 {
             meta = sniffer.probe(devicePath: devicePath)
+        }
+
+        // System-only partitions with no user files (e.g. the 16 MB Microsoft Reserved partition Windows puts on GPT
+        // disks, or the 8 MB reserved partition ZFS adds when it is given a whole disk)
+        let systemPartitionTypes = ["Microsoft Reserved", "EFI", "Linux Swap", "Linux_Swap", "Apple_Boot",
+                                    "6A945A3B-1DD2-11B2-99A6-080020736631"]
+        if meta == nil && systemPartitionTypes.contains(content) {
+            return nil
         }
 
         // If internal Mac drive and no foreign superblock was detected, ignore it
@@ -115,6 +135,12 @@ public actor DiskScanner {
             }
         } else if let fsName = infoDict["FilesystemType"] as? String ?? infoDict["FilesystemName"] as? String {
             detectedType = mapSystemFSType(fsName)
+        } else if content.localizedCaseInsensitiveContains("ZFS") {
+            // ZFS partition type GUIDs (Solaris/illumos, FreeBSD, OpenZFS on Linux): readable without the superblock
+            detectedType = .zfs
+        } else if content.localizedCaseInsensitiveContains("Linux") && !content.localizedCaseInsensitiveContains("swap") {
+            // Superblocks can only be read as root; the partition type still tells us it's a Linux filesystem
+            detectedType = .unknown(magic: "Linux")
         } else {
             detectedType = .unknown(magic: "unrecognized")
         }
@@ -128,6 +154,21 @@ public actor DiskScanner {
             volumeName = bsdName
         }
 
+        // The device model is only reported on the whole disk (e.g. "Realtek RTL9210B-CG Media")
+        let wholeDisk = (infoDict["ParentWholeDisk"] as? String) ?? bsdName
+        let wholeInfo = wholeDisk == bsdName ? infoDict : (wholeDiskInfo(wholeDisk) ?? infoDict)
+        var model = (wholeInfo["IORegistryEntryName"] as? String) ?? (wholeInfo["MediaName"] as? String) ?? ""
+        if model.hasSuffix(" Media") {
+            model = String(model.dropLast(" Media".count))
+        }
+        let driveKind = DriveKind.classify(
+            model: model.isEmpty ? (wholeInfo["MediaName"] as? String ?? "") : model,
+            busProtocol: busProtocol,
+            solidState: wholeInfo["SolidState"] as? Bool,
+            isVirtual: (wholeInfo["VirtualOrPhysical"] as? String) == "Virtual",
+            removableMedia: (wholeInfo["RemovableMedia"] as? Bool) ?? false
+        )
+
         return DiskPartition(
             bsdName: bsdName,
             totalSizeBytes: sizeBytes,
@@ -137,8 +178,22 @@ public actor DiskScanner {
             mountPoint: mountPoint,
             isReadOnly: isReadOnly,
             isRemovable: isRemovable,
-            isInternal: isInternal
+            isInternal: isInternal,
+            driveKind: driveKind,
+            deviceModel: model.isEmpty ? nil : model,
+            connection: busProtocol.isEmpty ? nil : busProtocol
         )
+    }
+
+    private var wholeDiskCache: [String: [String: Any]] = [:]
+
+    private func wholeDiskInfo(_ bsdName: String) -> [String: Any]? {
+        if let cached = wholeDiskCache[bsdName] {
+            return cached
+        }
+        let info = fetchDiskInfo(bsdName: bsdName)
+        wholeDiskCache[bsdName] = info
+        return info
     }
 
     private func fetchDiskInfo(bsdName: String) -> [String: Any]? {
@@ -168,6 +223,9 @@ public actor DiskScanner {
         if lower.contains("ntfs") { return .ntfs }
         if lower.contains("btrfs") { return .btrfs }
         if lower.contains("xfs") { return .xfs }
+        if lower.contains("zfs") { return .zfs }
+        if lower.contains("f2fs") { return .f2fs }
+        if lower.contains("udf") { return .udf }
         if lower.contains("exfat") { return .exfat }
         if lower.contains("msdos") || lower.contains("fat") { return .vfat }
         if lower.contains("apfs") { return .apfs }

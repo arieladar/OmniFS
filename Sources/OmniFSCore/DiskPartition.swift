@@ -47,7 +47,30 @@ public struct DiskPartition: Identifiable, Sendable, Hashable {
     /// Whether the underlying device is a built-in internal Mac drive
     public let isInternal: Bool
 
-    /// Whether this partition can be mounted with write support via OmniFS
+    /// Kind of physical device (NVMe, SSD, HDD, flash drive, SD card, disk image)
+    public let driveKind: DriveKind
+
+    /// Device model as reported by macOS, e.g. "Samsung PSSD T7 Shield"
+    public let deviceModel: String?
+
+    /// Connection type as reported by macOS, e.g. "USB", "Thunderbolt"
+    public let connection: String?
+
+    /// Human-readable device summary, e.g. "NVMe SSD · Realtek RTL9210B-CG · USB"
+    public var deviceSummary: String {
+        ([driveKind.description, deviceModel, connection] as [String?])
+            .compactMap { $0 }
+            .filter { !$0.isEmpty }
+            .joined(separator: " · ")
+    }
+
+    /// Whether OmniFS can check and repair this filesystem (with its Linux tool, inside the VM)
+    public var supportsRepair: Bool {
+        // udftools has no checker
+        return fileSystemType.requiresOmniFSDriver && fileSystemType != .udf
+    }
+
+    /// Whether this partition can be mounted with write support (natively or via the OmniFS Linux VM)
     public var canOmniFSMountReadWrite: Bool {
         return fileSystemType.requiresOmniFSDriver || fileSystemType.isNativeWritableOnMacOS
     }
@@ -66,7 +89,7 @@ public struct DiskPartition: Identifiable, Sendable, Hashable {
         // Exclude raw unknown partitions on internal fixed drives
         if isInternal {
             switch fileSystemType {
-            case .ext2, .ext3, .ext4, .ntfs, .btrfs, .xfs:
+            case .ext2, .ext3, .ext4, .ntfs, .btrfs, .xfs, .zfs, .f2fs, .udf:
                 return true
             default:
                 return false
@@ -85,7 +108,10 @@ public struct DiskPartition: Identifiable, Sendable, Hashable {
         mountPoint: String? = nil,
         isReadOnly: Bool = false,
         isRemovable: Bool = true,
-        isInternal: Bool = false
+        isInternal: Bool = false,
+        driveKind: DriveKind = .unknown,
+        deviceModel: String? = nil,
+        connection: String? = nil
     ) {
         self.bsdName = bsdName
         self.totalSizeBytes = totalSizeBytes
@@ -96,6 +122,9 @@ public struct DiskPartition: Identifiable, Sendable, Hashable {
         self.isReadOnly = isReadOnly
         self.isRemovable = isRemovable
         self.isInternal = isInternal
+        self.driveKind = driveKind
+        self.deviceModel = deviceModel
+        self.connection = connection
     }
 
     /// Formatted human-readable size (e.g. "64.0 GB")
@@ -105,71 +134,4 @@ public struct DiskPartition: Identifiable, Sendable, Hashable {
         formatter.countStyle = .file
         return formatter.string(fromByteCount: Int64(totalSizeBytes))
     }
-
-    // MARK: - Sample & Demo Partitions
-
-    public static let sampleExt4 = DiskPartition(
-        bsdName: "disk4s2",
-        totalSizeBytes: 128 * 1024 * 1024 * 1024,
-        volumeName: "Ubuntu_Linux",
-        fileSystemType: .ext4,
-        metadata: SuperblockMetadata(
-            fileSystemType: .ext4,
-            volumeName: "Ubuntu_Linux",
-            uuid: "a4f8e219-c09a-4e89-b789-8d193fa09823",
-            blockSize: 4096,
-            totalBlocks: 31457280,
-            freeBlocks: 18239010,
-            isClean: true,
-            lastMountTime: Date(),
-            featuresDescription: "has_journal, extents, 64bit, flex_bg, dir_index, large_dir"
-        ),
-        mountPoint: "/Volumes/Ubuntu_Linux",
-        isReadOnly: false,
-        isRemovable: true
-    )
-
-    public static let sampleNTFS = DiskPartition(
-        bsdName: "disk5s1",
-        totalSizeBytes: 500 * 1024 * 1024 * 1024,
-        volumeName: "Windows_Data",
-        fileSystemType: .ntfs,
-        metadata: SuperblockMetadata(
-            fileSystemType: .ntfs,
-            volumeName: "Windows_Data",
-            uuid: "3C82-9B14-829A-40D1",
-            blockSize: 4096,
-            totalBlocks: 122070312,
-            freeBlocks: 64102930,
-            isClean: true,
-            lastMountTime: Date().addingTimeInterval(-86400),
-            featuresDescription: "MFT Journal, Sparse Files, Reparse Points, USN Journal"
-        ),
-        mountPoint: nil,
-        isReadOnly: false,
-        isRemovable: true
-    )
-
-    public static let sampleBtrfs = DiskPartition(
-        bsdName: "disk6s1",
-        totalSizeBytes: 64 * 1024 * 1024 * 1024,
-        volumeName: "Arch_CoW",
-        fileSystemType: .btrfs,
-        metadata: SuperblockMetadata(
-            fileSystemType: .btrfs,
-            volumeName: "Arch_CoW",
-            uuid: "d9e8c7b6-a5f4-4321-b012-3456789abcde",
-            blockSize: 4096,
-            totalBlocks: 15625000,
-            freeBlocks: 8901234,
-            isClean: true,
-            lastMountTime: Date().addingTimeInterval(-172800),
-            featuresDescription: "mixed_groups, extref, skinny_metadata, subvolumes"
-        ),
-        mountPoint: "/Volumes/Arch_CoW",
-        isReadOnly: true,
-        isRemovable: true
-    )
-
-    public static let samples: [DiskPartition] = [sampleExt4, sampleNTFS, sampleBtrfs]
 }

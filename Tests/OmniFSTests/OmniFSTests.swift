@@ -177,17 +177,6 @@ struct OmniFSTests {
         }
     }
 
-    @Test func testSamplePartitions() {
-        let samples = DiskPartition.samples
-        #expect(samples.count == 3)
-        #expect(DiskPartition.sampleExt4.fileSystemType == .ext4)
-        #expect(DiskPartition.sampleExt4.isMounted == true)
-        #expect(DiskPartition.sampleNTFS.fileSystemType == .ntfs)
-        #expect(DiskPartition.sampleNTFS.isMounted == false)
-        #expect(DiskPartition.sampleBtrfs.fileSystemType == .btrfs)
-        #expect(DiskPartition.sampleBtrfs.isReadOnly == true)
-    }
-
     @Test func testInternalMacDiskExclusion() {
         let macInternalAPFS = DiskPartition(
             bsdName: "disk0s2",
@@ -224,5 +213,18 @@ struct OmniFSTests {
             isInternal: false
         )
         #expect(externalExt4.isForeignOrRemovable == true)
+    }
+
+    @Test func testDriveKindClassification() {
+        // The two drives this was calibrated on: a Samsung T7 Shield and an NVMe drive in an RTL9210 enclosure
+        #expect(DriveKind.classify(model: "Samsung PSSD T7 Shield", busProtocol: "USB", solidState: true, isVirtual: false, removableMedia: false) == .ssd)
+        #expect(DriveKind.classify(model: "Realtek RTL9210B-CG", busProtocol: "USB", solidState: true, isVirtual: false, removableMedia: false) == .nvme)
+        #expect(DriveKind.classify(model: "APPLE SSD AP0256Z", busProtocol: "Apple Fabric", solidState: true, isVirtual: false, removableMedia: false) == .nvme)
+        #expect(DriveKind.classify(model: "WD Elements 25A2", busProtocol: "USB", solidState: false, isVirtual: false, removableMedia: false) == .hdd)
+        #expect(DriveKind.classify(model: "SanDisk Cruzer Blade", busProtocol: "USB", solidState: nil, isVirtual: false, removableMedia: true) == .flashDrive)
+        #expect(DriveKind.classify(model: "Generic USB Disk", busProtocol: "USB", solidState: nil, isVirtual: false, removableMedia: true) == .flashDrive)
+        #expect(DriveKind.classify(model: "Apple SDXC Reader", busProtocol: "Secure Digital", solidState: true, isVirtual: false, removableMedia: true) == .sdCard)
+        #expect(DriveKind.classify(model: "Apple UDIF read-write", busProtocol: "Disk Image", solidState: nil, isVirtual: true, removableMedia: false) == .diskImage)
+        #expect(DriveKind.classify(model: "Mystery", busProtocol: "USB", solidState: nil, isVirtual: false, removableMedia: false) == .unknown)
     }
 }

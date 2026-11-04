@@ -8,6 +8,9 @@ public enum FileSystemType: Hashable, Sendable, CustomStringConvertible {
     case ntfs
     case btrfs
     case xfs
+    case zfs
+    case f2fs
+    case udf
     case vfat
     case exfat
     case apfs
@@ -22,6 +25,9 @@ public enum FileSystemType: Hashable, Sendable, CustomStringConvertible {
         case .ntfs: return "NTFS"
         case .btrfs: return "Btrfs"
         case .xfs: return "XFS"
+        case .zfs: return "ZFS"
+        case .f2fs: return "F2FS"
+        case .udf: return "UDF"
         case .vfat: return "FAT32 (VFAT)"
         case .exfat: return "exFAT"
         case .apfs: return "APFS"
@@ -32,11 +38,11 @@ public enum FileSystemType: Hashable, Sendable, CustomStringConvertible {
 
     public var family: FileSystemFamily {
         switch self {
-        case .ext2, .ext3, .ext4, .btrfs, .xfs:
+        case .ext2, .ext3, .ext4, .btrfs, .xfs, .zfs, .f2fs:
             return .linux
         case .ntfs:
             return .windows
-        case .vfat, .exfat:
+        case .vfat, .exfat, .udf:
             return .universal
         case .apfs, .hfsplus:
             return .apple
@@ -48,7 +54,7 @@ public enum FileSystemType: Hashable, Sendable, CustomStringConvertible {
     /// Whether macOS natively supports read operations out of the box.
     public var isNativeReadableOnMacOS: Bool {
         switch self {
-        case .ntfs, .vfat, .exfat, .apfs, .hfsplus:
+        case .ntfs, .vfat, .exfat, .apfs, .hfsplus, .udf:
             return true
         default:
             return false
@@ -69,7 +75,7 @@ public enum FileSystemType: Hashable, Sendable, CustomStringConvertible {
     /// Whether OmniFS provides extended read-write support for this filesystem.
     public var requiresOmniFSDriver: Bool {
         switch self {
-        case .ext2, .ext3, .ext4, .ntfs, .btrfs, .xfs:
+        case .ext2, .ext3, .ext4, .ntfs, .btrfs, .xfs, .zfs, .f2fs, .udf:
             return true
         case .vfat, .exfat, .apfs, .hfsplus, .unknown:
             return false

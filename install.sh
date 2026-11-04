@@ -12,24 +12,39 @@ echo "=================================================="
 echo "[1/4] Building OmniFS release binaries..."
 swift build -c release
 
+# Linux VM guest (kernel + initramfs) used for ext4 / Btrfs / XFS / NTFS read & write
+if [ ! -f "$DIR/.build/vm/Image" ] || [ "$DIR/Resources/vm/init" -nt "$DIR/.build/vm/initramfs.cpio.gz" ] \
+   || [ "$DIR/scripts/build_vm_image.py" -nt "$DIR/.build/vm/initramfs.cpio.gz" ]; then
+    python3 -I "$DIR/scripts/build_vm_image.py" "$DIR/.build/vm"
+fi
+
 # 2. Package & Code-Sign Bundles
 echo "[2/5] Packaging and code-signing bundles..."
 mkdir -p "$DIR/OmniFS.prefPane/Contents/MacOS"
 mkdir -p "$DIR/OmniFS.prefPane/Contents/Resources"
 cp "$DIR/.build/release/libOmniFSPrefPane.dylib" "$DIR/OmniFS.prefPane/Contents/MacOS/OmniFS"
 chmod +x "$DIR/OmniFS.prefPane/Contents/MacOS/OmniFS"
+cp "$DIR/Resources/Info-PrefPane.plist" "$DIR/OmniFS.prefPane/Contents/Info.plist"
 cp "$DIR/Resources/AppIcon.icns" "$DIR/OmniFS.prefPane/Contents/Resources/OmniFS.icns"
 cp "$DIR/Resources/AppIcon_1024.png" "$DIR/OmniFS.prefPane/Contents/Resources/AppIcon.png"
+cp "$DIR/.build/release/omnifs-vmd" "$DIR/OmniFS.prefPane/Contents/MacOS/omnifs-vmd"
+rm -rf "$DIR/OmniFS.prefPane/Contents/Resources/vm" && cp -R "$DIR/.build/vm" "$DIR/OmniFS.prefPane/Contents/Resources/vm"
 
 mkdir -p "$DIR/OmniFS.app/Contents/MacOS"
 mkdir -p "$DIR/OmniFS.app/Contents/Resources"
 cp "$DIR/.build/release/OmniFSSettings" "$DIR/OmniFS.app/Contents/MacOS/OmniFSSettings"
 chmod +x "$DIR/OmniFS.app/Contents/MacOS/OmniFSSettings"
+cp "$DIR/Resources/Info-App.plist" "$DIR/OmniFS.app/Contents/Info.plist"
 cp "$DIR/Resources/AppIcon.icns" "$DIR/OmniFS.app/Contents/Resources/AppIcon.icns"
 cp "$DIR/Resources/AppIcon_1024.png" "$DIR/OmniFS.app/Contents/Resources/AppIcon.png"
+cp "$DIR/.build/release/omnifs-vmd" "$DIR/OmniFS.app/Contents/MacOS/omnifs-vmd"
+rm -rf "$DIR/OmniFS.app/Contents/Resources/vm" && cp -R "$DIR/.build/vm" "$DIR/OmniFS.app/Contents/Resources/vm"
 
-codesign --force --deep -s - "$DIR/OmniFS.app"
-codesign --force --deep -s - "$DIR/OmniFS.prefPane"
+ENTITLEMENTS="$DIR/Resources/vm/omnifs-vmd.entitlements"
+codesign --force -s - --entitlements "$ENTITLEMENTS" "$DIR/OmniFS.app/Contents/MacOS/omnifs-vmd"
+codesign --force -s - --entitlements "$ENTITLEMENTS" "$DIR/OmniFS.prefPane/Contents/MacOS/omnifs-vmd"
+codesign --force -s - "$DIR/OmniFS.app"
+codesign --force -s - "$DIR/OmniFS.prefPane"
 
 ALL_USERS=false
 for arg in "$@"; do
@@ -37,6 +52,11 @@ for arg in "$@"; do
         ALL_USERS=true
     fi
 done
+
+# Quit anything holding the old code: System Settings keeps a loaded pref pane in its legacyLoader process
+osascript -e 'quit app "System Settings"' 2>/dev/null || true
+pkill -f legacyLoader 2>/dev/null || true
+pkill -x OmniFSSettings 2>/dev/null || true
 
 # 3. Install PreferencePane
 if [ "$ALL_USERS" = true ]; then
@@ -64,9 +84,16 @@ xattr -cr "$HOME/Applications/OmniFS.app" 2>/dev/null || true
 
 # 5. Optional CLI binary
 if [ -d "$HOME/.local/bin" ]; then
+    # rm first: copying over a running binary in place (e.g. an omnifs-vmd serving a mounted drive) can crash it
+    rm -f "$HOME/.local/bin/omnifs" "$HOME/.local/bin/omnifs-vmd"
     cp "$DIR/.build/release/omnifs" "$HOME/.local/bin/omnifs"
     chmod +x "$HOME/.local/bin/omnifs"
     codesign --force -s - "$HOME/.local/bin/omnifs" 2>/dev/null || true
+    cp "$DIR/.build/release/omnifs-vmd" "$HOME/.local/bin/omnifs-vmd"
+    codesign --force -s - --entitlements "$ENTITLEMENTS" "$HOME/.local/bin/omnifs-vmd"
+    mkdir -p "$HOME/Library/Application Support/OmniFS"
+    rm -rf "$HOME/Library/Application Support/OmniFS/vm"
+    cp -R "$DIR/.build/vm" "$HOME/Library/Application Support/OmniFS/vm"
 fi
 
 echo "[5/5] Activating OmniFS in System Settings..."
