@@ -2,8 +2,8 @@ import Foundation
 import Virtualization
 import OmniFSCore
 
-// omnifs-vmd: boots the OmniFS Linux guest with one partition attached, waits for it to export
-// the volume over NFS, then keeps the VM alive until the macOS NFS mount goes away.
+// omnifs-vmd: boots the OmniFS Linux guest with one partition attached, waits for it to share the volume
+// over SMB, then keeps the VM alive until the macOS mount goes away.
 // With --repair it instead runs the filesystem's checker in the guest and records the result.
 //
 // Usage: omnifs-vmd --disk <dev|image> --fs <ntfs|ext2|ext3|ext4|btrfs|xfs|zfs> --state <file>
@@ -43,10 +43,10 @@ struct Arguments {
         if repair && readOnly {
             die("--repair needs write access; it cannot be combined with --ro")
         }
-        // Same sanitizing as the guest init: the name becomes the NFS export path, which Finder shows
-        name = name.filter { $0 != "/" && $0 != "\"" && !$0.isNewline }
+        // Same sanitizing as the guest init: the name becomes the SMB share name, which Finder shows
+        name = name.filter { !"/\"[]".contains($0) && !$0.isNewline }
         if name.isEmpty {
-            name = URL(fileURLWithPath: mountPoint).lastPathComponent.filter { $0 != "/" && $0 != "\"" }
+            name = URL(fileURLWithPath: mountPoint).lastPathComponent.filter { !"/\"[]".contains($0) }
         }
         if name.isEmpty {
             name = "volume"
@@ -107,6 +107,46 @@ func authopen(_ path: String, readOnly: Bool) -> Int32? {
     return control.withUnsafeBytes { $0.load(fromByteOffset: 12, as: Int32.self) }
 }
 
+/// Lock held for the VM's lifetime on the MAC slot it uses
+nonisolated(unsafe) var macSlotLock: Int32 = -1
+
+/// The NAT's DHCP server leases an address per MAC for about an hour, and random MACs (one per VM) exhausted its
+/// 253 addresses after a few test runs, so no VM could get onto the network. A fixed pool of MACs (with the user ID
+/// in them, so users never collide) keeps reusing the same leases. A slot is held with a lock while its VM runs.
+func acquireMACSlot() -> VZMACAddress? {
+    let directory = VMMountRegistry.directory
+    try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+    // Take the least recently used free slot: right after a VM exits, the NAT may still know its MAC for a moment,
+    // and a new VM reusing it immediately got no DHCP answer
+    let uid = getuid()
+    var best: (slot: Int, fd: Int32, used: Double)?
+    for slot in 0..<64 {
+        let path = directory.appendingPathComponent("mac-slot-\(slot).lock").path
+        let fd = open(path, O_CREAT | O_RDWR, 0o600)
+        guard fd >= 0 else { continue }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            continue
+        }
+        var info = stat()
+        let used = fstat(fd, &info) == 0 ? Double(info.st_mtimespec.tv_sec) : 0
+        if let current = best, current.used <= used {
+            flock(fd, LOCK_UN)
+            close(fd)
+        } else {
+            if let previous = best {
+                flock(previous.fd, LOCK_UN)
+                close(previous.fd)
+            }
+            best = (slot, fd, used)
+        }
+    }
+    guard let best else { return nil }  // more than 64 VMs at once: fall back to a random MAC
+    futimes(best.fd, nil)  // mark as just used
+    macSlotLock = best.fd
+    return VZMACAddress(string: String(format: "02:4f:46:%02x:%02x:%02x", (uid >> 8) & 0xff, uid & 0xff, best.slot))
+}
+
 func die(_ message: String) -> Never {
     FileHandle.standardError.write(Data("omnifs-vmd: \(message)\n".utf8))
     exit(1)
@@ -121,6 +161,8 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
     let fromGuest = Pipe()
     var buffer = Data()
     var phase = Phase.booting
+    /// Password of the guest's SMB share, valid for this VM only; handed to MountManager through the state file
+    let secret = (0..<24).map { _ in "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789".randomElement()! }.map(String.init).joined()
     var waitedForMount = 0
 
     enum Phase { case booting, waitingForMount, mounted, stopping }
@@ -138,7 +180,6 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
         boot.initialRamdiskURL = vmDir.appendingPathComponent("initramfs.cpio.gz")
         let debug = ProcessInfo.processInfo.environment["OMNIFS_DEBUG"] == "1"
         boot.commandLine = "console=hvc0 \(debug ? "omnifs.debug=1" : "quiet") omnifs.fs=\(args.fs) omnifs.ro=\(args.readOnly ? 1 : 0) omnifs.mkfs=\(args.format ? 1 : 0) omnifs.action=\(args.repair ? "repair" : "mount")"
-            + (ProcessInfo.processInfo.environment["OMNIFS_SHARE"].map { " omnifs.share=\($0)" } ?? "")
         config.bootLoader = boot
         // Every core the Mac has, and a quarter of its unified memory (guest RAM is only backed as it is used)
         config.cpuCount = min(ProcessInfo.processInfo.activeProcessorCount, VZVirtualMachineConfiguration.maximumAllowedCPUCount)
@@ -173,9 +214,8 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
 
             let network = VZVirtioNetworkDeviceConfiguration()
             network.attachment = VZNATNetworkDeviceAttachment()
-            // Recovery aid: reusing a previous VM's MAC address gets its IP back from the NAT's DHCP, so NFS requests
-            // a Mac process is still waiting on can complete
-            if let mac = ProcessInfo.processInfo.environment["OMNIFS_MAC"].flatMap(VZMACAddress.init(string:)) {
+            // OMNIFS_MAC (recovery aid) reuses a previous VM's MAC address, and so its IP; otherwise take a slot MAC
+            if let mac = ProcessInfo.processInfo.environment["OMNIFS_MAC"].flatMap(VZMACAddress.init(string:)) ?? acquireMACSlot() {
                 network.macAddress = mac
             }
             config.networkDevices = [network]
@@ -241,14 +281,16 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
     private func handle(line: String) {
         if line == "OMNIFS_WANT_NAME" {
             toGuest.fileHandleForWriting.write(Data("\(args.name)\n".utf8))
+        } else if line == "OMNIFS_WANT_SECRET" {
+            toGuest.fileHandleForWriting.write(Data("\(secret)\n".utf8))
         } else if line.hasPrefix("OMNIFS_READY ip="), phase == .booting {
-            // The guest reports its export path itself (its shell may normalize the name, e.g. trim spaces)
+            // The guest reports its share name itself (its shell may normalize the name, e.g. trim spaces)
             let fields = line.dropFirst("OMNIFS_READY ip=".count)
             let ip = String(fields.prefix { $0 != " " })
-            let exportPath = fields.range(of: " export=").map { String(fields[$0.upperBound...]) } ?? "/exports/\(args.name)"
+            let share = fields.range(of: " export=").map { String(fields[$0.upperBound...]) } ?? args.name
             prepareMountPoint()
             phase = .waitingForMount
-            state.write(.init(pid: getpid(), status: .ready, ip: ip, exportPath: exportPath, mountPoint: args.mountPoint, readOnly: args.readOnly, message: nil))
+            state.write(.init(pid: getpid(), status: .ready, ip: ip, share: share, secret: secret, mountPoint: args.mountPoint, readOnly: args.readOnly, message: nil))
         } else if line.hasPrefix("OMNIFS_REPAIRED "), args.repair {
             state.write(.init(pid: getpid(), status: .repaired, ip: nil, mountPoint: args.mountPoint, readOnly: false,
                               message: String(line.dropFirst("OMNIFS_REPAIRED ".count))))
@@ -339,7 +381,7 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
         exit(1)
     }
 
-    /// If the guest is gone while macOS still has its NFS export mounted, every access to that mount would hang;
+    /// If the guest is gone while macOS still has its share mounted, every access to that mount would hang;
     /// drop the mount so Finder and apps get errors instead
     private func forceUnmount(_ mountPoint: String) {
         guard VMMountRegistry.isMountPoint(mountPoint) else { return }

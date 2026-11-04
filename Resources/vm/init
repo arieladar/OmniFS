@@ -1,9 +1,9 @@
 #!/bin/busybox sh
 # OmniFS guest init: mounts the attached partition (/dev/vda) with the Linux kernel driver
-# and exports it to macOS over NFSv3, or checks and repairs it. Talks to omnifs-vmd over the console (hvc0):
-#   guest -> host: OMNIFS_WANT_NAME | OMNIFS_READY ip=<addr> export=<path> | OMNIFS_REPAIRED <summary>
-#                  | OMNIFS_ERROR <message> | OMNIFS_STOPPED
-#   host -> guest: <volume name> (answering OMNIFS_WANT_NAME), then "shutdown"
+# and shares it with macOS over SMB, or checks and repairs it. Talks to omnifs-vmd over the console (hvc0):
+#   guest -> host: OMNIFS_WANT_NAME | OMNIFS_WANT_SECRET | OMNIFS_READY ip=<addr> export=<share name>
+#                  | OMNIFS_REPAIRED <summary> | OMNIFS_ERROR <message> | OMNIFS_STOPPED
+#   host -> guest: <volume name>, <share password> (answering the WANT lines), then "shutdown"
 # Kernel command line: omnifs.fs=<ntfs|ext2|ext3|ext4|btrfs|xfs|zfs|f2fs|udf> omnifs.ro=<0|1>
 #                      omnifs.action=<mount|repair> omnifs.mkfs=<0|1> (test images only)
 
@@ -15,6 +15,10 @@ mount -t sysfs sys /sys
 mount -t devtmpfs dev /dev
 mount -t tmpfs tmp /run
 ln -sfn /run /var/run
+# A resolvable hostname: Samba looks its own name up during every connection setup, and without one (there is
+# no DNS here) each lookup waits for a 5 s timeout, enough for the Mac to give up connecting
+hostname omnifs
+printf '127.0.0.1 localhost omnifs omnifs.local\n::1 localhost omnifs omnifs.local\n' >/etc/hosts
 depmod -a
 exec </dev/console >/dev/console 2>&1
 
@@ -142,11 +146,15 @@ fi
 
 # ----- Mount and export -----
 
-# Finder names NFS volumes after the export path, so export under the volume's name (sent by omnifs-vmd)
+# Finder shows SMB volumes under their share name, so share under the volume's name (sent by omnifs-vmd),
+# protected by a password that is only valid for this VM (also sent over the console, never on the command line)
 echo "OMNIFS_WANT_NAME"
 read -r VOLNAME
-VOLNAME=$(echo "$VOLNAME" | tr -d '/"')
+VOLNAME=$(echo "$VOLNAME" | tr -d '/"[]')
 [ -n "$VOLNAME" ] || VOLNAME=volume
+echo "OMNIFS_WANT_SECRET"
+read -r SECRET
+[ -n "$SECRET" ] || fail "no share password received"
 EXPORT="/exports/$VOLNAME"
 mkdir -p "$EXPORT"
 [ "$RO" = "1" ] && MODE=ro || MODE=rw
@@ -186,80 +194,77 @@ cat >/run/udhcpc.sh <<'EOF'
 [ "$1" = bound ] || [ "$1" = renew ] || exit 0
 ip addr flush dev "$interface"
 ip addr add "$ip/${mask:-24}" dev "$interface"
-# rpc.statd looks up the Mac's hostname when it first takes a lock; without DNS every lookup waits for its
-# timeout, which stalled the first file access on each mount for ~95 s
-{ echo "options timeout:1 attempts:1"; for ns in $dns; do echo "nameserver $ns"; done; } >/etc/resolv.conf
 EOF
 chmod +x /run/udhcpc.sh
 udhcpc -i eth0 -s /run/udhcpc.sh -q -n -t 20 >/dev/null 2>&1 || fail "network configuration failed"
 IP=$(ip -4 -o addr show eth0 | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p')
 
-# SMB server (ksmbd), selected with omnifs.share=smb: one share named after the volume, served as root
-if [ "$(arg share)" = "smb" ]; then
-    load ksmbd || fail "ksmbd unavailable"
-    mkdir -p /etc/ksmbd /run/ksmbd
-    [ "$RO" = "1" ] && SHARE_RO=yes || SHARE_RO=no
-    cat >/etc/ksmbd/ksmbd.conf <<EOF
+# SMB server: Samba with vfs_fruit, the configuration macOS clients are built for. macOS's SMB client handles
+# locking itself and mounts through NetFS, so Finder can delete on these volumes. Everything is served as root so
+# the Mac user can read and write the whole volume. (The in-kernel ksmbd was tried first: it marks a whole file
+# delete-pending while one of its streams is deleted, breaking macOS copies, and refuses to rename folders whose
+# files the Mac still holds open, breaking Finder renames.)
+mkdir -p /etc/samba /run/samba/lock /run/samba/state /run/samba/cache /run/samba/private /var/log/samba
+[ "$RO" = "1" ] && SHARE_RO=yes || SHARE_RO=no
+[ "$(arg debug)" = "1" ] && LOGLEVEL=3 || LOGLEVEL=0
+cat >/etc/samba/smb.conf <<EOF
 [global]
-    server signing = disabled
-    smb2 leases = yes
-    durable handles = yes
+    server role = standalone server
+    netbios name = OMNIFS
+    security = user
+    map to guest = never
+    passdb backend = tdbsam:/run/samba/private/passdb.tdb
+    lock directory = /run/samba/lock
+    state directory = /run/samba/state
+    cache directory = /run/samba/cache
+    private dir = /run/samba/private
+    pid directory = /run/samba
+    log file = /dev/console
+    log level = $LOGLEVEL
+    disable netbios = yes
+    smb ports = 445
+    server min protocol = SMB2_10
+    load printers = no
+    printcap name = /dev/null
+    disable spoolss = yes
+    # macOS client support: Mac metadata as named streams in xattrs (no ._ files), POSIX-style renames of
+    # folders with open files, characters that are legal on macOS but not in SMB names
+    vfs objects = catia fruit streams_xattr
+    fruit:metadata = stream
+    fruit:posix_rename = yes
+    fruit:zero_file_id = yes
+    fruit:nfs_aces = no
+    fruit:veto_appledouble = no
+    fruit:wipe_intentionally_left_blank_rfork = yes
+    fruit:delete_empty_adfiles = yes
+    ea support = yes
+    # No SMB2 leases: with them the Mac reuses a file's lease key after its folder is renamed, which Samba rejects,
+    # so writes to files in a just-renamed folder fail (EINVAL). Without them a folder rename can be refused for a
+    # moment right after its files were used (the client is still closing them) and works when retried.
+    smb2 leases = no
+    # Performance: async I/O on every request, zero-copy reads
+    use sendfile = yes
+    aio read size = 1
+    aio write size = 1
 [$VOLNAME]
     path = $EXPORT
     read only = $SHARE_RO
+$([ "$TYPE" = "udf" ] && printf '    # UDF has no extended attributes: no metadata streams, macOS keeps ._ files instead\n    vfs objects = catia\n    ea support = no')
+    valid users = omnifs
     force user = root
     force group = root
-    streams = yes
 EOF
-    ksmbd.adduser -a omnifs -p omnifs >/dev/null || fail "ksmbd user setup failed"
-    ksmbd.mountd || fail "ksmbd.mountd failed"
-    echo "OMNIFS_READY ip=$IP export=smb:$VOLNAME"
-    while read -r cmd; do
-        [ "$cmd" = shutdown ] && break
-    done
-    ksmbd.control -s >/dev/null 2>&1
-    sync
-    if [ "$TYPE" = "zfs" ]; then
-        umount -l "$EXPORT"
-        zpool export "$POOL" || zpool export -f "$POOL"
-    else
-        umount "$EXPORT" || umount -l "$EXPORT"
-    fi
-    sync
-    echo "OMNIFS_STOPPED"
-    poweroff -f
-fi
+printf '%s\n%s\n' "$SECRET" "$SECRET" | smbpasswd -c /etc/samba/smb.conf -s -a omnifs >/dev/null || fail "Samba user setup failed"
+smbd -s /etc/samba/smb.conf -D || fail "smbd failed to start"
+for i in $(seq 50); do nc -z 127.0.0.1 445 2>/dev/null && break; sleep 0.1; done
 
-# NFSv3 server; all clients act as root inside the guest so the macOS user can read and write everything.
-# Filesystems mounted below the export (ZFS child datasets) are exported too, each with its own fsid.
-load nfsd
-mount -t nfsd nfsd /proc/fs/nfsd || fail "nfsd unavailable"
-OPTIONS="rw,insecure,no_subtree_check,all_squash,anonuid=0,anongid=0"
-echo "\"$EXPORT\" *($OPTIONS,fsid=1)" >/etc/exports
-FSID=1
-awk '{print $2}' /proc/mounts | while read -r mp; do
-    mp=$(printf '%b' "$(echo "$mp" | sed 's/\\\([0-7]\{3\}\)/\\0\1/g')")
-    case "$mp" in
-        "$EXPORT"/*) FSID=$((FSID + 1)); echo "\"$mp\" *($OPTIONS,nohide,fsid=$FSID)" >>/etc/exports ;;
-    esac
-done
-rpcbind -w || fail "rpcbind failed"
-# NFS file locking (NLM): macOS's default and Finder/NetFS mounts require rpc.statd on the server
-mkdir -p /var/lib/nfs/sm /var/lib/nfs/sm.bak
-rpc.statd --no-notify || fail "rpc.statd failed"
-exportfs -ra || fail "exportfs failed"
-rpc.mountd -p 20048 || fail "rpc.mountd failed"
-# One nfsd thread per vCPU times four: every core can serve requests in parallel
-rpc.nfsd -p 2049 -N 4 $(( $(nproc) * 4 )) || fail "rpc.nfsd failed"
-
-echo "OMNIFS_READY ip=$IP export=$EXPORT"
+echo "OMNIFS_READY ip=$IP export=$VOLNAME"
 
 while read -r cmd; do
     [ "$cmd" = shutdown ] && break
 done
 
-exportfs -ua
-rpc.nfsd 0
+killall smbd 2>/dev/null
 sync
 if [ "$TYPE" = "zfs" ]; then
     # Lazy unmount detaches the whole rbind tree at once (busybox umount has no -R)

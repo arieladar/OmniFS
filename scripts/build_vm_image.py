@@ -2,7 +2,8 @@
 """Builds the OmniFS guest VM (Linux kernel + initramfs) from Alpine Linux aarch64 packages.
 
 The guest mounts the attached partition with the Linux kernel's own filesystem drivers
-(ext4, btrfs, xfs, ntfs3) and exports it to macOS over NFS. Runs on macOS without Docker.
+(ntfs3, ext4, btrfs, xfs, f2fs, udf, OpenZFS) and shares it with macOS over SMB (Samba with vfs_fruit).
+Runs on macOS without Docker.
 
 Usage: scripts/build_vm_image.py [output_dir]   (default: .build/vm)
 """
@@ -21,21 +22,28 @@ ALPINE = "https://dl-cdn.alpinelinux.org/alpine/v3.24"
 REPOS = ["main", "community"]
 ARCH = "aarch64"
 
-PACKAGES = ["linux-virt", "busybox", "musl", "kmod", "nfs-utils", "rpcbind", "e2fsprogs", "ntfs-3g-progs", "btrfs-progs", "xfsprogs", "zfs", "zfs-virt", "f2fs-tools", "udftools", "ksmbd-tools"]
-# Dependencies that are irrelevant inside the guest (nfs-utils only uses python3 for optional scripts)
+PACKAGES = ["linux-virt", "busybox", "musl", "kmod", "e2fsprogs", "ntfs-3g-progs", "btrfs-progs", "xfsprogs", "zfs", "zfs-virt", "f2fs-tools", "udftools", "samba-server", "samba-common-tools"]
+# Dependencies that are irrelevant inside the guest
 SKIP = {"python3", "initramfs-generator", "/bin/sh"}
-MODULES = ["virtio_blk", "virtio_net", "virtio-rng", "af_packet", "ext4", "btrfs", "xfs", "ntfs3", "f2fs", "udf", "nfsd", "ksmbd"]
+MODULES = ["virtio_blk", "virtio_net", "virtio-rng", "af_packet", "ext4", "btrfs", "xfs", "ntfs3", "f2fs", "udf"]
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(ROOT, ".build", "vm")
 CACHE = os.path.join(ROOT, ".build", "vm-cache")
 
 
-def fetch(url, dest):
+def fetch(url, dest, attempts=4):
     if not os.path.exists(dest):
         print(f"  downloading {url.rsplit('/', 1)[-1]}")
-        with urllib.request.urlopen(url) as r, open(dest + ".part", "wb") as f:
-            shutil.copyfileobj(r, f)
+        for attempt in range(1, attempts + 1):
+            try:
+                with urllib.request.urlopen(url, timeout=60) as r, open(dest + ".part", "wb") as f:
+                    shutil.copyfileobj(r, f)
+                break
+            except OSError as error:
+                if attempt == attempts:
+                    raise
+                print(f"    retrying ({error})")
         os.rename(dest + ".part", dest)
     return dest
 
@@ -192,20 +200,18 @@ def main():
                 strip_module_debug_info(os.path.join(dirpath, f))
     for d in ["usr/share/man", "usr/share/doc", "usr/include", "usr/share/apk", "lib/apk"]:
         shutil.rmtree(os.path.join(rootfs, d), ignore_errors=True)
-    for d in ["proc", "sys", "dev", "run", "tmp", "exports", "var/lib/nfs/rpc_pipefs", "var/lib/nfs/v4recovery", "etc"]:
+    for d in ["proc", "sys", "dev", "run", "tmp", "exports", "etc"]:
         os.makedirs(os.path.join(rootfs, d), exist_ok=True)
-    # rpcbind drops privileges to the "rpc" user and exits silently if it does not exist
+    # Samba authenticates the Mac as "omnifs" (it needs a Unix account) and serves files as root ("force user")
     with open(os.path.join(rootfs, "etc", "passwd"), "w") as f:
-        f.write("root:x:0:0:root:/root:/bin/sh\nrpc:x:100:101:rpc:/var/lib/nfs:/sbin/nologin\nnobody:x:65534:65534:nobody:/:/sbin/nologin\n")
+        f.write("root:x:0:0:root:/root:/bin/sh\nomnifs:x:1000:1000:OmniFS:/:/sbin/nologin\n"
+                "nobody:x:65534:65534:nobody:/:/sbin/nologin\n")
     with open(os.path.join(rootfs, "etc", "group"), "w") as f:
-        f.write("root:x:0:\nrpc:x:101:\nnobody:x:65534:\n")
+        f.write("root:x:0:\nomnifs:x:1000:\nnobody:x:65534:\n")
     # ZFS records the importing host's ID in the pool; a fixed ID keeps pools imported by one OmniFS VM
     # importable by the next instead of looking "in use from another system"
     with open(os.path.join(rootfs, "etc", "hostid"), "wb") as f:
         f.write(struct.pack("<I", 0x0F5F5F01))
-    # rpcbind and nfs-utils look up their ports by service name
-    with open(os.path.join(rootfs, "etc", "services"), "w") as f:
-        f.write("sunrpc 111/tcp portmapper\nsunrpc 111/udp portmapper\nnfs 2049/tcp\nnfs 2049/udp\n")
     shutil.copy(os.path.join(ROOT, "Resources", "vm", "init"), os.path.join(rootfs, "init"))
     os.chmod(os.path.join(rootfs, "init"), 0o755)
 

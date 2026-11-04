@@ -9,17 +9,21 @@ public struct VMMountRecord: Codable, Sendable {
     public var pid: Int32
     public var status: Status
     public var ip: String?
-    /// NFS export path in the guest, e.g. "/exports/Ariel Adar"
-    public var exportPath: String?
+    /// SMB share name in the guest, e.g. "Ariel Adar" (Finder shows the volume under this name)
+    public var share: String?
+    /// Password of the share, valid for this VM only
+    public var secret: String?
     public var mountPoint: String
     public var readOnly: Bool
     public var message: String?
 
-    public init(pid: Int32, status: Status, ip: String?, exportPath: String? = nil, mountPoint: String, readOnly: Bool, message: String?) {
+    public init(pid: Int32, status: Status, ip: String?, share: String? = nil, secret: String? = nil,
+                mountPoint: String, readOnly: Bool, message: String?) {
         self.pid = pid
         self.status = status
         self.ip = ip
-        self.exportPath = exportPath
+        self.share = share
+        self.secret = secret
         self.mountPoint = mountPoint
         self.readOnly = readOnly
         self.message = message
@@ -37,7 +41,7 @@ public struct VMMountState: Sendable {
 
     public var stopFile: URL { stateFile.appendingPathExtension("stop") }
 
-    /// Created by the app once its NFS mount succeeded, so the helper notices even a very quick unmount.
+    /// Created by the app once its mount succeeded, so the helper notices even a very quick unmount.
     public var mountedFile: URL { stateFile.appendingPathExtension("mounted") }
 
     public var stopRequested: Bool { FileManager.default.fileExists(atPath: stopFile.path) }
@@ -52,7 +56,8 @@ public struct VMMountState: Sendable {
     public func write(_ record: VMMountRecord) {
         guard let data = try? JSONEncoder().encode(record) else { return }
         try? data.write(to: stateFile, options: .atomic)
-        chmod(stateFile.path, 0o644)
+        // Holds the share password: owner only
+        chmod(stateFile.path, 0o600)
     }
 
     public func update(_ body: (inout VMMountRecord) -> Void) {
