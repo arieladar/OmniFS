@@ -79,11 +79,6 @@ public struct VMMountState: Sendable {
 public enum VMMountRegistry {
     private final class BundleToken {}
 
-    /// User-owned folder holding the mount points of VM-served volumes (Finder lists them like /Volumes mounts).
-    public static var volumesDirectory: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/OmniFS/Volumes", isDirectory: true)
-    }
-
     /// Per-user directory holding one state file per partition served by a VM.
     public static var directory: URL {
         FileManager.default.temporaryDirectory.appendingPathComponent("OmniFS", isDirectory: true)

@@ -39,19 +39,20 @@ private final class TestDisk {
             try Self.setNTFSDirtyFlag(image: image)
         }
 
-        let output = try run("/usr/bin/hdiutil", ["attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount", image.path])
-        // One line per device: "/dev/disk5  <content>". Filesystems formatted on the raw image are the whole disk;
-        // ZFS partitions a whole disk itself (like on a real drive), so its pool is the first non-reserved partition.
-        let devices = output.split(separator: "\n").compactMap { line -> (String, String)? in
-            let fields = line.split(separator: "\t").map { $0.trimmingCharacters(in: .whitespaces) }
-            guard let device = fields.first, device.hasPrefix("/dev/disk") else { return nil }
-            return (String(device.dropFirst("/dev/".count)), fields.count > 1 ? fields[1] : "")
+        // diskutil image, not the deprecated hdiutil (whose attaches took ~2 minutes each on macOS 27.3)
+        let output = try run("/usr/sbin/diskutil", ["image", "attach", "--noMount", image.path])
+        guard let device = output.split(whereSeparator: \.isWhitespace).first(where: { $0.hasPrefix("/dev/disk") }) else {
+            throw TestError("diskutil image attach printed no device: \(output)")
         }
-        guard let whole = devices.first?.0 else {
-            throw TestError("hdiutil attach printed no device: \(output)")
-        }
-        wholeDisk = whole
-        bsdName = devices.first { $0.0 != whole && !$0.1.hasPrefix("6A945A3B") }?.0 ?? whole
+        wholeDisk = String(device.dropFirst("/dev/".count))
+        // Filesystems formatted on the raw image are the whole disk; ZFS partitions a whole disk itself (like on a
+        // real drive), so its pool is the first partition other than ZFS's reserved one
+        let list = try PropertyListSerialization.propertyList(
+            from: Data(try run("/usr/sbin/diskutil", ["list", "-plist", wholeDisk]).utf8), format: nil
+        ) as? [String: Any]
+        let partitions = ((list?["AllDisksAndPartitions"] as? [[String: Any]])?.first?["Partitions"] as? [[String: Any]]) ?? []
+        bsdName = partitions.first { !(($0["Content"] as? String) ?? "").hasPrefix("6A945A3B") }?["DeviceIdentifier"] as? String
+            ?? wholeDisk
     }
 
     /// Formats the image inside the guest (`omnifs-vmd --format`), then shuts the VM down cleanly.
@@ -122,7 +123,7 @@ private final class TestDisk {
     }
 
     func detach() {
-        _ = try? run("/usr/bin/hdiutil", ["detach", "-force", "/dev/\(wholeDisk)"])
+        _ = try? run("/usr/sbin/diskutil", ["eject", "/dev/\(wholeDisk)"])
         try? FileManager.default.removeItem(at: workDir)
     }
 }
@@ -189,7 +190,8 @@ private func makeRandomFile(at url: URL, bytes: Int) throws {
     try data.write(to: url)
 }
 
-@Suite("Volume integration (real disks through the OmniFS VM)", .serialized, .enabled(if: integrationEnabled))
+// A hang (e.g. a blocked NFS call) fails the test instead of stalling the run
+@Suite("Volume integration (real disks through the OmniFS VM)", .serialized, .enabled(if: integrationEnabled), .timeLimit(.minutes(3)))
 struct VolumeIntegrationTests {
     init() {
         setenv("OMNIFS_VMD", helper.path, 1)
@@ -281,6 +283,16 @@ struct VolumeIntegrationTests {
         try fm.removeItem(at: volume.appendingPathComponent("Renamed folder"))
         #expect(!fm.fileExists(atPath: volume.appendingPathComponent("big.bin").path))
         #expect(!fm.fileExists(atPath: volume.appendingPathComponent("Renamed folder").path))
+
+        // File locks (Finder and copyfile take them) must not hang: they stay local to this Mac
+        let lockFile = volume.appendingPathComponent("locked.txt")
+        try "lock".write(to: lockFile, atomically: false, encoding: .utf8)
+        let fd = open(lockFile.path, O_RDWR)
+        #expect(fd >= 0)
+        #expect(flock(fd, LOCK_EX | LOCK_NB) == 0)
+        flock(fd, LOCK_UN)
+        close(fd)
+        try fm.removeItem(at: lockFile)
 
         // Files must show as the user's own, or Finder refuses to modify or trash them
         let attributes = try fm.attributesOfItem(atPath: volume.path)
@@ -406,6 +418,21 @@ struct VolumeIntegrationTests {
         // The drive is free again, so it can be mounted once more
         _ = try await mount(disk)
         try await unmount(disk)
+    }
+
+    @Test("Without a custom mount point, volumes mount in /Volumes under their name, like other drives")
+    func mountsInVolumes() async throws {
+        let disk = try await TestDisk(filesystem: "ntfs")
+        defer { disk.detach() }
+        let partition = try #require(await DiskScanner().inspectDisk(bsdName: disk.bsdName))
+        let result = try await MountManager().mount(partition: partition, options: .standardReadWrite)
+        #expect(result.success, "mount failed: \(result.message)")
+        #expect(result.mountPoint.hasPrefix("/Volumes/OMNIFS"))
+        #expect(VMMountRegistry.isMountPoint(result.mountPoint))
+        // The helper tracks the path NetFS chose, so the drive shows as mounted there and unmounts cleanly
+        #expect(await DiskScanner().inspectDisk(bsdName: disk.bsdName)?.mountPoint == result.mountPoint)
+        try await unmount(disk)
+        #expect(!FileManager.default.fileExists(atPath: result.mountPoint))
     }
 
     @Test("A second mount of the same drive is refused while one is in progress")

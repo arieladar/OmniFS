@@ -138,9 +138,12 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
         boot.initialRamdiskURL = vmDir.appendingPathComponent("initramfs.cpio.gz")
         let debug = ProcessInfo.processInfo.environment["OMNIFS_DEBUG"] == "1"
         boot.commandLine = "console=hvc0 \(debug ? "omnifs.debug=1" : "quiet") omnifs.fs=\(args.fs) omnifs.ro=\(args.readOnly ? 1 : 0) omnifs.mkfs=\(args.format ? 1 : 0) omnifs.action=\(args.repair ? "repair" : "mount")"
+            + (ProcessInfo.processInfo.environment["OMNIFS_SHARE"].map { " omnifs.share=\($0)" } ?? "")
         config.bootLoader = boot
-        config.cpuCount = 2
-        config.memorySize = 1024 * 1024 * 1024
+        // Every core the Mac has, and a quarter of its unified memory (guest RAM is only backed as it is used)
+        config.cpuCount = min(ProcessInfo.processInfo.activeProcessorCount, VZVirtualMachineConfiguration.maximumAllowedCPUCount)
+        let quarter = ProcessInfo.processInfo.physicalMemory / 4
+        config.memorySize = min(max(quarter, 1 << 30), 8 << 30, VZVirtualMachineConfiguration.maximumAllowedMemorySize)
         config.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
 
         do {
@@ -253,19 +256,24 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
         try? FileManager.default.createDirectory(atPath: args.mountPoint, withIntermediateDirectories: true)
     }
 
+    /// Where macOS mounted the export: NetFS may pick another /Volumes path than requested, which MountManager
+    /// records in the state file (only MountManager writes it after "ready", so the two never race)
+    private var mountPoint: String {
+        state.read()?.mountPoint ?? args.mountPoint
+    }
+
     private func tick() {
         switch phase {
         case .waitingForMount:
-            if VMMountRegistry.isMountPoint(args.mountPoint) || state.mountConfirmed {
+            if VMMountRegistry.isMountPoint(mountPoint) || state.mountConfirmed {
                 phase = .mounted
-                state.update { $0.status = .mounted }
             } else if state.stopRequested || waitedForMount >= 90 {
                 shutdown(unmountFirst: false)
             }
             waitedForMount += 1
         case .mounted:
             // Unmounted from Finder, diskutil or omnifs: release the partition
-            if !VMMountRegistry.isMountPoint(args.mountPoint) {
+            if !VMMountRegistry.isMountPoint(mountPoint) {
                 shutdown(unmountFirst: false)
             } else if state.stopRequested {
                 shutdown(unmountFirst: true)
@@ -282,10 +290,10 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
         guard phase != .stopping else { return }
         let wasBooting = phase == .booting
         phase = .stopping
-        if unmountFirst && VMMountRegistry.isMountPoint(args.mountPoint) {
+        if unmountFirst && VMMountRegistry.isMountPoint(mountPoint) {
             let umount = Process()
             umount.executableURL = URL(fileURLWithPath: "/sbin/umount")
-            umount.arguments = ["-f", args.mountPoint]
+            umount.arguments = ["-f", mountPoint]
             try? umount.run()
             umount.waitUntilExit()
         }
@@ -304,8 +312,9 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
     }
 
     private func finish(code: Int32) -> Never {
-        forceUnmount()
-        rmdir(args.mountPoint)
+        let mountPoint = mountPoint
+        forceUnmount(mountPoint)
+        rmdir(mountPoint)
         // A repair's result stays for MountManager to read (it removes the file)
         if !args.repair {
             state.remove()
@@ -315,8 +324,10 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
 
     func fail(_ message: String) -> Never {
         FileHandle.standardError.write(Data("omnifs-vmd: \(message)\n".utf8))
+        // Read before the failure record below replaces the mount point MountManager recorded
+        let mountPoint = mountPoint
         state.write(.init(pid: getpid(), status: .failed, ip: nil, mountPoint: args.mountPoint, readOnly: args.readOnly, message: message))
-        forceUnmount()
+        forceUnmount(mountPoint)
         if phase != .waitingForMount && phase != .mounted {
             rmdir(args.mountPoint)
         }
@@ -325,11 +336,11 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
 
     /// If the guest is gone while macOS still has its NFS export mounted, every access to that mount would hang;
     /// drop the mount so Finder and apps get errors instead
-    private func forceUnmount() {
-        guard VMMountRegistry.isMountPoint(args.mountPoint) else { return }
+    private func forceUnmount(_ mountPoint: String) {
+        guard VMMountRegistry.isMountPoint(mountPoint) else { return }
         let umount = Process()
         umount.executableURL = URL(fileURLWithPath: "/sbin/umount")
-        umount.arguments = ["-f", args.mountPoint]
+        umount.arguments = ["-f", mountPoint]
         try? umount.run()
         umount.waitUntilExit()
     }

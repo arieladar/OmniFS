@@ -44,8 +44,11 @@ for i in $(seq 50); do
 done
 [ -b /dev/vda ] || fail "partition device did not appear"
 
-# ZFS keeps its cache in guest RAM; cap it well below the VM's 1 GB
-load_zfs() { load zfs zfs_arc_max=268435456 || fail "the ZFS kernel module could not be loaded"; }
+# ZFS keeps its cache in guest RAM; let it use half of the VM's memory
+load_zfs() {
+    arc=$(( $(sed -n 's/^MemTotal: *\([0-9]*\) kB/\1/p' /proc/meminfo) * 512 ))
+    load zfs zfs_arc_max=$arc || fail "the ZFS kernel module could not be loaded"
+}
 
 # Imports the pool on /dev/vda with its datasets under /zfs; sets POOL
 import_zfs_pool() {
@@ -183,10 +186,49 @@ cat >/run/udhcpc.sh <<'EOF'
 [ "$1" = bound ] || [ "$1" = renew ] || exit 0
 ip addr flush dev "$interface"
 ip addr add "$ip/${mask:-24}" dev "$interface"
+# rpc.statd looks up the Mac's hostname when it first takes a lock; without DNS every lookup waits for its
+# timeout, which stalled the first file access on each mount for ~95 s
+{ echo "options timeout:1 attempts:1"; for ns in $dns; do echo "nameserver $ns"; done; } >/etc/resolv.conf
 EOF
 chmod +x /run/udhcpc.sh
 udhcpc -i eth0 -s /run/udhcpc.sh -q -n -t 20 >/dev/null 2>&1 || fail "network configuration failed"
 IP=$(ip -4 -o addr show eth0 | sed -n 's/.* inet \([0-9.]*\)\/.*/\1/p')
+
+# SMB server (ksmbd), selected with omnifs.share=smb: one share named after the volume, served as root
+if [ "$(arg share)" = "smb" ]; then
+    load ksmbd || fail "ksmbd unavailable"
+    mkdir -p /etc/ksmbd /run/ksmbd
+    [ "$RO" = "1" ] && SHARE_RO=yes || SHARE_RO=no
+    cat >/etc/ksmbd/ksmbd.conf <<EOF
+[global]
+    server signing = disabled
+    smb2 leases = yes
+    durable handles = yes
+[$VOLNAME]
+    path = $EXPORT
+    read only = $SHARE_RO
+    force user = root
+    force group = root
+    streams = yes
+EOF
+    ksmbd.adduser -a omnifs -p omnifs >/dev/null || fail "ksmbd user setup failed"
+    ksmbd.mountd || fail "ksmbd.mountd failed"
+    echo "OMNIFS_READY ip=$IP export=smb:$VOLNAME"
+    while read -r cmd; do
+        [ "$cmd" = shutdown ] && break
+    done
+    ksmbd.control -s >/dev/null 2>&1
+    sync
+    if [ "$TYPE" = "zfs" ]; then
+        umount -l "$EXPORT"
+        zpool export "$POOL" || zpool export -f "$POOL"
+    else
+        umount "$EXPORT" || umount -l "$EXPORT"
+    fi
+    sync
+    echo "OMNIFS_STOPPED"
+    poweroff -f
+fi
 
 # NFSv3 server; all clients act as root inside the guest so the macOS user can read and write everything.
 # Filesystems mounted below the export (ZFS child datasets) are exported too, each with its own fsid.
@@ -202,9 +244,13 @@ awk '{print $2}' /proc/mounts | while read -r mp; do
     esac
 done
 rpcbind -w || fail "rpcbind failed"
+# NFS file locking (NLM): macOS's default and Finder/NetFS mounts require rpc.statd on the server
+mkdir -p /var/lib/nfs/sm /var/lib/nfs/sm.bak
+rpc.statd --no-notify || fail "rpc.statd failed"
 exportfs -ra || fail "exportfs failed"
 rpc.mountd -p 20048 || fail "rpc.mountd failed"
-rpc.nfsd -p 2049 -N 4 8 || fail "rpc.nfsd failed"
+# One nfsd thread per vCPU times four: every core can serve requests in parallel
+rpc.nfsd -p 2049 -N 4 $(( $(nproc) * 4 )) || fail "rpc.nfsd failed"
 
 echo "OMNIFS_READY ip=$IP export=$EXPORT"
 

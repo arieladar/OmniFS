@@ -21,10 +21,10 @@ ALPINE = "https://dl-cdn.alpinelinux.org/alpine/v3.24"
 REPOS = ["main", "community"]
 ARCH = "aarch64"
 
-PACKAGES = ["linux-virt", "busybox", "musl", "kmod", "nfs-utils", "rpcbind", "e2fsprogs", "ntfs-3g-progs", "btrfs-progs", "xfsprogs", "zfs", "zfs-virt", "f2fs-tools", "udftools"]
+PACKAGES = ["linux-virt", "busybox", "musl", "kmod", "nfs-utils", "rpcbind", "e2fsprogs", "ntfs-3g-progs", "btrfs-progs", "xfsprogs", "zfs", "zfs-virt", "f2fs-tools", "udftools", "ksmbd-tools"]
 # Dependencies that are irrelevant inside the guest (nfs-utils only uses python3 for optional scripts)
 SKIP = {"python3", "initramfs-generator", "/bin/sh"}
-MODULES = ["virtio_blk", "virtio_net", "virtio-rng", "af_packet", "ext4", "btrfs", "xfs", "ntfs3", "f2fs", "udf", "nfsd"]
+MODULES = ["virtio_blk", "virtio_net", "virtio-rng", "af_packet", "ext4", "btrfs", "xfs", "ntfs3", "f2fs", "udf", "nfsd", "ksmbd"]
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.abspath(sys.argv[1]) if len(sys.argv) > 1 else os.path.join(ROOT, ".build", "vm")
