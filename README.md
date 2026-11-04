@@ -78,7 +78,8 @@ omnifs inspect /dev/rdisk4s1         # Dump superblock metadata of a device or i
 ./build_dmg.sh       # Builds a distributable OmniFS.dmg
 ```
 
-The VM image is built by `scripts/build_vm_image.py` into `.build/vm`. After a plain `swift build`, sign the
+The VM image is built by `scripts/build_vm_image.py` into `.build/vm`; it needs the LLVM linker for one small guest
+library (`brew install lld`). After a plain `swift build`, sign the
 development helper so it may use the Virtualization framework:
 
 ```bash

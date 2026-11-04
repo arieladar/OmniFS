@@ -14,7 +14,8 @@ swift build -c release
 
 # Linux VM guest (kernel + initramfs) used for ext4 / Btrfs / XFS / NTFS read & write
 if [ ! -f "$DIR/.build/vm/Image" ] || [ "$DIR/Resources/vm/init" -nt "$DIR/.build/vm/initramfs.cpio.gz" ] \
-   || [ "$DIR/scripts/build_vm_image.py" -nt "$DIR/.build/vm/initramfs.cpio.gz" ]; then
+   || [ "$DIR/scripts/build_vm_image.py" -nt "$DIR/.build/vm/initramfs.cpio.gz" ] \
+   || [ "$DIR/Resources/vm/smbdelete-preload.c" -nt "$DIR/.build/vm/initramfs.cpio.gz" ]; then
     python3 -I "$DIR/scripts/build_vm_image.py" "$DIR/.build/vm"
 fi
 

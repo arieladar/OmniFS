@@ -381,6 +381,26 @@ struct VolumeIntegrationTests {
 
     // MARK: - Btrfs subvolumes and ZFS datasets
 
+    @Test("A folder of just-written files can be deleted at once, like Finder's Delete Immediately", arguments: ["ntfs", "ext4"].filter(allFilesystems.contains))
+    func deleteJustWrittenFolder(filesystem: String) async throws {
+        let disk = try await TestDisk(filesystem: filesystem)
+        defer { disk.detach() }
+        let volume = URL(fileURLWithPath: try await mount(disk))
+        let fm = FileManager.default
+        // No retries: Finder doesn't retry either, it reports the folder as skipped
+        for round in 0..<10 {
+            let folder = volume.appendingPathComponent("round \(round)")
+            try fm.createDirectory(at: folder.appendingPathComponent("sub"), withIntermediateDirectories: true)
+            for i in 0..<5 {
+                try Data("file \(i)".utf8).write(to: folder.appendingPathComponent("f\(i).txt"))
+                try Data("nested \(i)".utf8).write(to: folder.appendingPathComponent("sub/n\(i).txt"))
+            }
+            try fm.removeItem(at: folder)
+            #expect(!fm.fileExists(atPath: folder.path))
+        }
+        try await unmount(disk)
+    }
+
     @Test("Btrfs subvolumes and ZFS child datasets are reachable and writable", arguments: [
         ("btrfs", "@home", "subvolume.txt", "inside a subvolume"),
         ("zfs", "child", "dataset.txt", "inside a child dataset"),

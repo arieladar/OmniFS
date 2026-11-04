@@ -153,7 +153,10 @@ read -r VOLNAME
 VOLNAME=$(echo "$VOLNAME" | tr -d '/"[]')
 [ -n "$VOLNAME" ] || VOLNAME=volume
 echo "OMNIFS_WANT_SECRET"
+# The console echoes input, which would put the password in the helper's log
+stty -echo 2>/dev/null
 read -r SECRET
+stty echo 2>/dev/null
 [ -n "$SECRET" ] || fail "no share password received"
 EXPORT="/exports/$VOLNAME"
 mkdir -p "$EXPORT"
@@ -255,7 +258,8 @@ $([ "$TYPE" = "udf" ] && printf '    # UDF has no extended attributes: no metada
     force group = root
 EOF
 printf '%s\n%s\n' "$SECRET" "$SECRET" | smbpasswd -c /etc/samba/smb.conf -s -a omnifs >/dev/null || fail "Samba user setup failed"
-smbd -s /etc/samba/smb.conf -D || fail "smbd failed to start"
+# The preload lets folders holding only the Mac's .smbdelete placeholders be deleted (see smbdelete-preload.c)
+LD_PRELOAD=/usr/lib/omnifs-smbdelete.so smbd -s /etc/samba/smb.conf -D || fail "smbd failed to start"
 for i in $(seq 50); do nc -z 127.0.0.1 445 2>/dev/null && break; sleep 0.1; done
 
 echo "OMNIFS_READY ip=$IP export=$VOLNAME"

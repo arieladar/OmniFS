@@ -196,3 +196,12 @@ streams). Image: 33 MB (adds `samba-server`, `samba-common-tools`).
 - Measured on M4: write 400 MB + fsync ~650–750 MB/s, mount ~1.5 s, unmount incl. VM shutdown ~2 s.
 - Integration suite: all 10 tests (9 filesystems) pass in ~2.5 min with at most 5 disks at a time.
 
+- Deleting folders (Finder "some items had to be skipped"): the Mac's SMB client keeps a just-written file open
+  for ~60 ms (something on the Mac reads new files; no process shows in lsof). Deleting it then, the client
+  renames it to `.smbdelete<id>` instead, and Samba refuses to delete the folder (it checks emptiness by listing it,
+  at the delete-disposition setinfo). Oplocks off and `veto files` (Samba then refuses the rename, EBUSY) did not
+  help. Fix: `Resources/vm/smbdelete-preload.c`, LD_PRELOADed into smbd, hides `.smbdelete*` from readdir and
+  removes them when an rmdir hits ENOTEMPTY. Built with Apple clang + Homebrew `ld.lld`
+  (`--target=aarch64-linux-musl -nostdlib -shared`). Test: `deleteJustWrittenFolder`.
+- The guest console no longer echoes the share password into `<bsd>.log` (`stty -echo` around the read).
+- Settings: visible Check & Repair (stethoscope) button; the dirty-NTFS error offers Repair & Mount Read & Write.

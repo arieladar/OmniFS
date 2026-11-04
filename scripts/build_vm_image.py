@@ -169,6 +169,17 @@ def strip_module_debug_info(path):
         f.write(out)
 
 
+def build_smbdelete_preload(dest):
+    """Compiles Resources/vm/smbdelete-preload.c for the guest (see the file). Needs ld.lld: brew install lld"""
+    lld = shutil.which("ld.lld") or next((p for p in ("/opt/homebrew/bin/ld.lld", "/usr/local/bin/ld.lld")
+                                          if os.path.exists(p)), None)
+    if not lld:
+        sys.exit("error: ld.lld not found; install it with: brew install lld")
+    subprocess.run(["clang", "--target=aarch64-linux-musl", f"--ld-path={lld}", "-nostdlib", "-shared", "-fPIC", "-O2",
+                    "-fno-stack-protector", "-Wall", "-Werror", "-o", dest,
+                    os.path.join(ROOT, "Resources", "vm", "smbdelete-preload.c")], check=True)
+
+
 def main():
     os.makedirs(CACHE, exist_ok=True)
     os.makedirs(OUT, exist_ok=True)
@@ -212,6 +223,7 @@ def main():
     # importable by the next instead of looking "in use from another system"
     with open(os.path.join(rootfs, "etc", "hostid"), "wb") as f:
         f.write(struct.pack("<I", 0x0F5F5F01))
+    build_smbdelete_preload(os.path.join(rootfs, "usr", "lib", "omnifs-smbdelete.so"))
     shutil.copy(os.path.join(ROOT, "Resources", "vm", "init"), os.path.join(rootfs, "init"))
     os.chmod(os.path.join(rootfs, "init"), 0o755)
 
