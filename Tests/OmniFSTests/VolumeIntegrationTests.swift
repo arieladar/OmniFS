@@ -435,6 +435,8 @@ struct VolumeIntegrationTests {
         )
         #expect(!refused.success)
         #expect(refused.message.localizedCaseInsensitiveContains("dirty"))
+        // The settings pane offers "Repair & Mount Read & Write" when the refusal says this
+        #expect(refused.message.contains("Check & Repair"))
 
         let repaired = try await MountManager().repair(partition: partition)
         #expect(repaired.success, "repair failed: \(repaired.message)")

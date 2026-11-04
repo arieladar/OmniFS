@@ -127,6 +127,8 @@ public struct VolumesSettingsView: View {
     @State private var statusBanner: StatusBannerInfo?
     @State private var inspectedPartition: DiskPartition?
     @State private var repairCandidate: DiskPartition?
+    /// Mount the repaired volume read & write afterwards (repair started from a refused mount)
+    @State private var mountAfterRepair = false
     @State private var searchText = ""
 
     public init() {}
@@ -156,12 +158,27 @@ public struct VolumesSettingsView: View {
             if let banner = statusBanner {
                 Section {
                     HStack(spacing: 10) {
-                        Image(systemName: banner.isError ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
-                            .foregroundStyle(banner.isError ? Color.red : Color.green)
+                        if banner.isBusy {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: banner.isError ? "exclamationmark.circle.fill" : "checkmark.circle.fill")
+                                .foregroundStyle(banner.isError ? Color.red : Color.green)
+                        }
                         Text(banner.message)
                             .font(.callout)
                             .textSelection(.enabled)
                         Spacer()
+                        if let partition = banner.repairable {
+                            Button {
+                                mountAfterRepair = true
+                                repairCandidate = partition
+                            } label: {
+                                Label("Repair & Mount Read & Write", systemImage: "stethoscope")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .fixedSize()
+                        }
                         Button {
                             statusBanner = nil
                         } label: {
@@ -169,6 +186,7 @@ public struct VolumesSettingsView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
+                        .disabled(banner.isBusy)
                     }
                     .padding(.vertical, 2)
                 }
@@ -269,11 +287,17 @@ public struct VolumesSettingsView: View {
             isPresented: Binding(get: { repairCandidate != nil }, set: { if !$0 { repairCandidate = nil } }),
             presenting: repairCandidate
         ) { partition in
-            Button("Check & Repair") {
-                Task { await repair(partition: partition) }
+            let thenMount = mountAfterRepair
+            Button(thenMount ? "Repair & Mount" : "Check & Repair") {
+                mountAfterRepair = false
+                Task { await repair(partition: partition, thenMountReadWrite: thenMount) }
             }
-        } message: { _ in
-            Text("The volume is unmounted while it is checked and mounted again afterwards. Checking a large drive can take a while; don't disconnect it until the check finishes.")
+            Button("Cancel", role: .cancel) { mountAfterRepair = false }
+        } message: { partition in
+            Text((partition.fileSystemType == .ntfs
+                  ? "OmniFS fixes common NTFS problems and clears the dirty flag; it is not a full chkdsk. If Windows is hibernated, shut it down fully from Windows instead: repairing would lose its unsaved session.\n\n"
+                  : "")
+                 + "The volume is unmounted while it is checked. Checking a large drive can take a while; don't disconnect it until the check finishes.")
         }
         .sheet(item: $inspectedPartition) { part in
             VolumeInspectorSheet(partition: part)
@@ -320,19 +344,26 @@ public struct VolumesSettingsView: View {
         let opts: MountOptions = readOnly ? .standardReadOnly : .standardReadWrite
         do {
             let res = try await MountManager.shared.mount(partition: partition, options: opts)
-            statusBanner = StatusBannerInfo(message: res.message, isError: !res.success)
+            // The guest refuses dirty volumes read & write and says to use Check & Repair
+            let needsRepair = !res.success && !readOnly && partition.supportsRepair && res.message.contains("Check & Repair")
+            statusBanner = StatusBannerInfo(message: res.message, isError: !res.success, repairable: needsRepair ? partition : nil)
             await refreshDisks()
         } catch {
             statusBanner = StatusBannerInfo(message: "Failed to mount \(partition.bsdName): \(error.localizedDescription)", isError: true)
         }
     }
 
-    private func repair(partition: DiskPartition) async {
-        statusBanner = StatusBannerInfo(message: "Checking \(partition.volumeName)… Don't disconnect the drive.", isError: false)
+    private func repair(partition: DiskPartition, thenMountReadWrite: Bool = false) async {
+        statusBanner = StatusBannerInfo(message: "Checking \(partition.volumeName)… Don't disconnect the drive.", isError: false, isBusy: true)
         do {
             let res = try await MountManager.shared.repair(partition: partition)
             statusBanner = StatusBannerInfo(message: "\(partition.volumeName): \(res.message)", isError: !res.success)
             await refreshDisks()
+            if res.success && thenMountReadWrite {
+                let repaired = partitions.first { $0.bsdName == partition.bsdName } ?? partition
+                statusBanner = StatusBannerInfo(message: "\(partition.volumeName): \(res.message) Mounting read & write…", isError: false, isBusy: true)
+                await mount(partition: repaired, readOnly: false)
+            }
         } catch {
             statusBanner = StatusBannerInfo(message: "Failed to check \(partition.bsdName): \(error.localizedDescription)", isError: true)
         }
@@ -362,6 +393,10 @@ private struct StatusBannerInfo: Identifiable {
     let id = UUID()
     let message: String
     let isError: Bool
+    /// Shows a spinner instead of the status icon while an operation runs
+    var isBusy = false
+    /// A volume refused because it needs a check first; the banner then offers to repair and mount it
+    var repairable: DiskPartition?
 }
 
 // MARK: - Native Apple Storage Capacity Bar
@@ -572,16 +607,19 @@ public struct VolumeRowView: View {
                         Button(action: onMountRO) {
                             Label("Mount Read-Only", systemImage: "lock")
                         }
-                        if partition.supportsRepair {
-                            Divider()
-                            Button(action: onRepair) {
-                                Label("Check & Repair…", systemImage: "stethoscope")
-                            }
-                        }
                     } label: {
                         Text("Mount")
                     }
                     .menuStyle(.borderedButton)
+                }
+
+                if partition.supportsRepair {
+                    Button(action: onRepair) {
+                        Image(systemName: "stethoscope")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Check & Repair…")
+                    .accessibilityLabel("Check & Repair")
                 }
 
                 Button(action: onInspect) {
@@ -832,7 +870,7 @@ public struct FileSystemsSettingsView: View {
             } header: {
                 Text("Windows File Systems")
             } footer: {
-                Text("Volumes left dirty by Windows hibernation, Fast Startup or a crash are refused read & write; use Check & Repair (right-click the volume), or shut Windows down fully.")
+                Text("Volumes left dirty by Windows hibernation, Fast Startup or a crash are refused read & write; use Check & Repair (the stethoscope button), or shut Windows down fully.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
