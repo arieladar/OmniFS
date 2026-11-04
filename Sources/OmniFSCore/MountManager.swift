@@ -1,4 +1,5 @@
 import Foundation
+import NetFS
 
 public actor MountManager {
     public static let shared = MountManager()
@@ -7,8 +8,8 @@ public actor MountManager {
 
     /// Mounts a partition with the specified options.
     ///
-    /// FAT/exFAT (and NTFS read-only) use the macOS drivers. ext2/3/4, NTFS read & write, Btrfs and XFS
-    /// are served by the OmniFS Linux VM (`omnifs-vmd`) and mounted over NFS. The partition's current
+    /// FAT/exFAT (and NTFS/UDF read-only) use the macOS drivers. ext2/3/4, NTFS read & write, Btrfs, XFS, ZFS, F2FS
+    /// and UDF read & write are served by the OmniFS Linux VM (`omnifs-vmd`) and mounted over SMB. The partition's current
     /// mount is restored if the new mount fails, so a failed remount never strands the volume.
     public func mount(partition: DiskPartition, options: MountOptions = .standardReadWrite) async throws -> MountResult {
         // One operation per partition at a time, across the pane, the app and the CLI: two helpers on one device
@@ -108,7 +109,7 @@ public actor MountManager {
         let wasMountedNatively = partition.isMounted && VMMountRegistry.activeRecord(bsdName: partition.bsdName) == nil
 
         if let existing = VMMountRegistry.activeRecord(bsdName: partition.bsdName) {
-            if existing.status == .mounted && existing.readOnly == options.isReadOnly {
+            if VMMountRegistry.isMountPoint(existing.mountPoint) && existing.readOnly == options.isReadOnly {
                 return MountResult(
                     success: true,
                     mountPoint: existing.mountPoint,
@@ -131,11 +132,12 @@ public actor MountManager {
         trace("\(partition.bsdName): mount \(filesystem) \(options.isReadOnly ? "ro" : "rw") via VM (was mounted natively: \(wasMountedNatively))")
 
         let mountName = partition.volumeName.isEmpty ? partition.bsdName : partition.volumeName
-        // /Volumes is root-only and macOS 27 refuses to hand disk devices to users, so VM-served volumes mount in a
-        // user-owned folder (Finder still lists them by name) and the helper opens the partition through authopen:
-        // a single macOS authorization dialog, no root shell
-        let targetDir = options.customMountPoint ?? uniqueVolumePath(for: mountName, in: VMMountRegistry.volumesDirectory.path)
-        try? FileManager.default.createDirectory(atPath: targetDir, withIntermediateDirectories: true)
+        // NetFS picks the final /Volumes path (e.g. "Name-1" if the name is taken); the helper watches the path
+        // recorded in the state file once mounted
+        let targetDir = options.customMountPoint ?? "/Volumes/\(mountName)"
+        if let custom = options.customMountPoint {
+            try? FileManager.default.createDirectory(atPath: custom, withIntermediateDirectories: true)
+        }
 
         try? FileManager.default.createDirectory(at: VMMountRegistry.directory, withIntermediateDirectories: true)
         let state = VMMountRegistry.state(bsdName: partition.bsdName)
@@ -143,7 +145,9 @@ public actor MountManager {
 
         func fail(_ message: String) -> MountResult {
             trace("\(partition.bsdName): failed: \(message)")
-            rmdir(targetDir)
+            if let custom = options.customMountPoint {
+                rmdir(custom)
+            }
             if wasMountedNatively {
                 _ = try? run("/usr/sbin/diskutil", ["mount", partition.bsdName])
             }
@@ -203,28 +207,71 @@ public actor MountManager {
             return fail(record?.message ?? reason.map { "The OmniFS VM failed: \($0)" } ?? "The OmniFS VM did not start in time.")
         }
 
-        let (mountStatus, mountOutput) = try run("/sbin/mount_nfs", [
-            // noowners: the guest serves every file as root, which Finder would treat as someone else's and refuse
-            // to trash or modify; show them as the current user (the guest still performs the operations as root)
-            "-o", "vers=3,tcp,port=2049,mountport=20048,nolocks,locallocks,noowners,intr",
-            "\(ip):\(record.exportPath ?? "/mnt/volume")", targetDir,
-        ])
-        guard mountStatus == 0 else {
+        let mounted = mountShare(
+            host: ip, share: record.share ?? mountName, password: record.secret ?? "", at: options.customMountPoint
+        )
+        guard let mountPoint = mounted.mountPoint else {
             await stopHelper()
-            return fail("Could not mount the volume from the OmniFS VM: \(mountOutput.trimmingCharacters(in: .whitespacesAndNewlines))")
+            return fail("Could not mount the volume from the OmniFS VM: \(mounted.error)")
         }
-
+        state.update { $0.mountPoint = mountPoint }
         state.confirmMounted()
-        trace("\(partition.bsdName): mounted at \(targetDir)")
+        trace("\(partition.bsdName): mounted at \(mountPoint)")
 
         let mode = options.isReadOnly ? "read-only" : "read & write"
         return MountResult(
             success: true,
-            mountPoint: targetDir,
+            mountPoint: mountPoint,
             fileSystemType: partition.fileSystemType,
             isReadOnly: options.isReadOnly,
-            message: "Mounted \(partition.fileSystemType) (\(mode)) via the OmniFS Linux VM at \(targetDir)"
+            message: "Mounted \(partition.fileSystemType) (\(mode)) via the OmniFS Linux VM at \(mountPoint)"
         )
+    }
+
+    /// Mounts the guest's SMB share through NetFS, the framework behind Finder's Connect to Server: Finder can then
+    /// delete on the volume (with its "delete immediately" prompt; network volumes have no Trash), file locking is
+    /// handled by the SMB client, and the volume lands in /Volumes without administrator rights. Without `directory`,
+    /// NetFS picks /Volumes/<share name>.
+    private func mountShare(host: String, share: String, password: String, at directory: String?) -> (mountPoint: String?, error: String) {
+        var components = URLComponents()
+        components.scheme = "smb"
+        components.host = host
+        components.path = "/" + share
+        guard let url = components.url else { return (nil, "invalid share name \(share)") }
+
+        let openOptions = NSMutableDictionary()
+        openOptions[kNAUIOptionKey] = kNAUIOptionNoUI
+        let mountOptions = NSMutableDictionary()
+        // The guest serves every file as root, which Finder would treat as someone else's and refuse to modify;
+        // show them as the current user (the guest still performs the operations as root)
+        mountOptions[kNetFSMountFlagsKey] = Int(MNT_IGNORE_OWNERSHIP | MNT_NOSUID | MNT_NODEV)
+        if directory != nil {
+            mountOptions[kNetFSMountAtMountDirKey] = true
+        }
+        // NetFS refuses mount directories reached through a symlink (ELOOP), e.g. /var/folders -> /private/var/folders.
+        // realpath, not resolvingSymlinksInPath, which strips the "/private" it resolves to
+        let mountDirectory = directory.map { path -> URL in
+            guard let resolved = realpath(path, nil) else { return URL(fileURLWithPath: path) }
+            defer { free(resolved) }
+            return URL(fileURLWithPath: String(cString: resolved))
+        }
+        // The first connections to a just-started Samba are occasionally reset (EPIPE/ECONNRESET); retry those
+        var status: Int32 = 0
+        var mountPoint: String?
+        for attempt in 1...4 {
+            var mountPoints: Unmanaged<CFArray>?
+            status = NetFSMountURLSync(
+                url as CFURL, mountDirectory.map { $0 as CFURL }, "omnifs" as CFString, password as CFString,
+                openOptions, mountOptions, &mountPoints
+            )
+            mountPoint = (mountPoints?.takeRetainedValue() as? [String])?.first
+            guard [EPIPE, ECONNRESET, ECONNREFUSED, ETIMEDOUT].contains(status), attempt < 4 else { break }
+            usleep(500_000)
+        }
+        guard status == 0, let mountPoint else {
+            return (nil, status > 0 ? String(cString: strerror(status)) : "NetFS error \(status)")
+        }
+        return (mountPoint, "")
     }
 
     /// Checks and repairs a partition with its Linux tool inside the VM (e2fsck, ntfsfix, xfs_repair, btrfs check,
@@ -288,7 +335,11 @@ public actor MountManager {
             let current = await DiskScanner().inspectDisk(bsdName: partition.bsdName) ?? partition
             let remount = try await mountWithVM(
                 partition: current, filesystem: filesystem,
-                options: MountOptions(isReadOnly: vmMount.readOnly, customMountPoint: vmMount.mountPoint)
+                // NetFS removes its /Volumes mount points on unmount; let it choose again
+                options: MountOptions(
+                    isReadOnly: vmMount.readOnly,
+                    customMountPoint: vmMount.mountPoint.hasPrefix("/Volumes/") ? nil : vmMount.mountPoint
+                )
             )
             mountPoint = remount.success ? remount.mountPoint : ""
             if !remount.success {
@@ -319,9 +370,16 @@ public actor MountManager {
     /// Unmounts a VM-served volume and waits for the helper to shut the VM down and release the partition.
     private func unmountVM(bsdName: String, force: Bool = false) async throws -> Bool {
         guard let record = VMMountRegistry.activeRecord(bsdName: bsdName) else { return true }
-        if VMMountRegistry.isMountPoint(record.mountPoint) {
-            guard try unmountSync(record.mountPoint, force: force) else { return false }
+        // Right after file activity macOS services (fseventsd, Finder) can hold the volume for a moment and the
+        // unmount reports "Resource busy"; retry for a few seconds like Finder does before giving up
+        var unmounted = !VMMountRegistry.isMountPoint(record.mountPoint)
+        for _ in 0..<20 where !unmounted {
+            unmounted = try unmountSync(record.mountPoint, force: force) || !VMMountRegistry.isMountPoint(record.mountPoint)
+            if !unmounted {
+                try await Task.sleep(for: .milliseconds(500))
+            }
         }
+        guard unmounted else { return false }
         VMMountRegistry.state(bsdName: bsdName).requestStop()
         // Longer than the helper's own 30 s force-stop, so a slow guest shutdown still counts as success
         for _ in 0..<80 where VMMountRegistry.activeRecord(bsdName: bsdName) != nil {
@@ -367,21 +425,14 @@ public actor MountManager {
         }
     }
 
-    private func uniqueVolumePath(for name: String, in directory: String) -> String {
-        var path = "\(directory)/\(name)"
-        var suffix = 1
-        while FileManager.default.fileExists(atPath: path) && !isEmptyDirectory(path) {
-            path = "\(directory)/\(name) \(suffix)"
-            suffix += 1
-        }
-        return path
-    }
-
-    private func isEmptyDirectory(_ path: String) -> Bool {
-        !VMMountRegistry.isMountPoint(path) && ((try? FileManager.default.contentsOfDirectory(atPath: path))?.isEmpty ?? false)
-    }
 
     private func unmountSync(_ target: String, force: Bool) throws -> Bool {
+        let umount = { try self.run("/sbin/umount", (force ? ["-f"] : []) + [target]).status == 0 }
+        // Mount points (the VM's SMB shares): plain umount takes ~1 s, diskutil ~6 s
+        if target.hasPrefix("/"), try umount() {
+            return true
+        }
+        // BSD names and macOS's own mounts go through DiskArbitration
         var args = ["unmount"]
         if force {
             args.append("force")
@@ -390,8 +441,7 @@ public actor MountManager {
         if try run("/usr/sbin/diskutil", args).status == 0 {
             return true
         }
-        // Fall back to umount for mounts that diskutil does not manage
-        return try run("/sbin/umount", (force ? ["-f"] : []) + [target]).status == 0
+        return target.hasPrefix("/") ? false : try umount()
     }
 
     private func currentMountPoint(bsdName: String) -> String? {

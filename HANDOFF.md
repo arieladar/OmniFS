@@ -153,3 +153,46 @@ scripts/build_vm_image.py.
 - **UDF** (kernel `udf`, `udftools`): detected by the NSR02/NSR03 volume recognition sequence at 32 KB;
   read-only via macOS's own driver, read & write (UDF ≤ 2.01) via the VM. No checker exists, so no Check & Repair.
 - Not possible: ReFS (no free driver); SMB/CIFS, S3FS, HDFS are network storage, not disk formats.
+
+## Transport switched from NFS to SMB (2026-11-03, late)
+
+**Supersedes the NFS details above** (mount_nfs, `noowners`/locking notes, ~/Library/Application Support mount
+points, `._` files).
+- Finder could not delete on mount_nfs mounts; NetFS (Connect to Server) mounts can, but NetFS NFS mounts
+  always use NLM network locking, and NLM between the Mac and the guest stalls the first open ~95 s or hangs
+  forever on hard mounts (a stuck mount even wedged a diskarbitrationd thread until a reboot).
+- Now: guest runs in-kernel **ksmbd** (`ksmbd-tools`); one share per volume named after it, `force user = root`,
+  per-VM random password (helper → guest over the console, → MountManager via the
+  0600 state file). MountManager mounts `smb://<ip>/<share>` through NetFS into /Volumes (MNT_IGNORE_OWNERSHIP).
+  NFS server, rpcbind and statd were removed from the image.
+- Measured on an M4 / NTFS test disk: mount 1.4 s, first open 0.01 s, 400 MB write+fsync 688 MB/s, unmount
+  incl. VM shutdown 1.9 s. Finder delete: "delete immediately"
+  prompt (network volumes have no Trash).
+- VM: all cores (`activeProcessorCount`), memory = 1/4 of RAM (1–8 GB), ZFS ARC = half of guest RAM.
+- Unmount of mount points uses `umount` (~1 s) before diskutil (~6 s).
+- Tests: `diskutil image attach` (hdiutil was ~2 min/attach while diskarbitrationd was wedged); cases run in
+  parallel; 3-minute per-test limit; always run with a stall watchdog.
+- No `streams_xattr`: ksmbd marks the whole inode delete-pending while a stream is deleted, so macOS copies
+  (copyfile replaces the new file's auto-added com.apple.provenance stream) failed with EACCES
+  (STATUS_DELETE_PENDING). Without streams macOS uses `._` files again. Samba with vfs_fruit would avoid this
+  but roughly doubles the image.
+
+## Final transport: Samba (2026-11-04)
+
+**Supersedes the ksmbd details above.** ksmbd broke macOS: deleting a file's stream marks the whole file
+delete-pending (copies with xattrs failed EACCES) and it refuses renaming folders whose files the Mac still has
+open. Now the guest runs **Samba 4.23 with `vfs_fruit`** (`catia fruit streams_xattr`, `fruit:metadata=stream`,
+`fruit:posix_rename`), so Mac metadata is stored natively (no `._` files, except on UDF, whose share disables
+streams). Image: 33 MB (adds `samba-server`, `samba-common-tools`).
+- Guest needs a resolvable hostname (`hostname omnifs` + /etc/hosts): Samba looks itself up on every connection
+  and each lookup otherwise waited 5 s, so macOS gave up connecting.
+- `smb2 leases = no`: with leases the Mac reuses a file's lease key after its folder is renamed, Samba rejects
+  it, and writes in a just-renamed folder fail (EINVAL). Without leases a folder rename can be refused for ~1 s
+  right after its files were used; retrying works (tests retry for up to 5 s).
+- MAC addresses come from a per-user pool of 64 slots (least recently used first): random MACs exhausted the
+  NAT's 253 DHCP leases (~1 h each) after a few parallel test runs, and reusing a slot the instant its VM exited
+  sometimes got no DHCP answer.
+- MountManager retries unmounts that report busy (up to 10 s) and NetFS mounts reset by a just-started Samba.
+- Measured on M4: write 400 MB + fsync ~650–750 MB/s, mount ~1.5 s, unmount incl. VM shutdown ~2 s.
+- Integration suite: all 10 tests (9 filesystems) pass in ~2.5 min with at most 5 disks at a time.
+

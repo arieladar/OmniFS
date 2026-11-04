@@ -280,7 +280,7 @@ public struct VolumesSettingsView: View {
         }
         .task {
             await refreshDisks()
-            // VM-served (NFS) mounts, drives without a mountable volume and the omnifs CLI don't reliably notify
+            // VM-served (SMB) mounts, drives without a mountable volume and the omnifs CLI don't reliably notify
             // this view, so poll a cheap snapshot and only rescan when it changes
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(3))
@@ -815,7 +815,7 @@ public struct FileSystemsSettingsView: View {
             } header: {
                 Text("Linux & Unix File Systems")
             } footer: {
-                Text("Linux volumes are served by a lightweight Linux VM (Apple Virtualization framework) and appear in Finder over a private NFS link. No kernel extensions or FUSE.")
+                Text("Linux volumes are served by a lightweight Linux VM (Apple Virtualization framework) and appear in Finder over a private SMB link. No kernel extensions or FUSE.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
             }
@@ -1022,7 +1022,7 @@ public struct AboutOmniFSView: View {
             Section("Specifications") {
                 LabeledContent("Operating System", value: "macOS 15 Sequoia (Darwin 27)")
                 LabeledContent("Architecture", value: "Apple Silicon (ARM64 Native)")
-                LabeledContent("Execution Model", value: "Linux VM (Virtualization.framework) + NFS")
+                LabeledContent("Execution Model", value: "Linux VM (Virtualization.framework) + SMB")
                 LabeledContent("Kernel Extensions", value: "None (Zero-Kext)")
                 LabeledContent("License", value: "MIT Open Source")
             }

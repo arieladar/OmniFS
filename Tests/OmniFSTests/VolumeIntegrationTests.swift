@@ -18,6 +18,32 @@ private let integrationEnabled = ProcessInfo.processInfo.environment["OMNIFS_INT
     && FileManager.default.isExecutableFile(atPath: helper.path)
     && FileManager.default.fileExists(atPath: vmDir.appendingPathComponent("Image").path)
 
+/// Limits how many test disks (each with its VMs) exist at once: all of them at once (40+ VMs) overloaded macOS's
+/// disk services. Half the cores keeps every core busy without that.
+private actor DiskSlots {
+    static let shared = DiskSlots(limit: max(2, ProcessInfo.processInfo.activeProcessorCount / 2))
+    private var available: Int
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(limit: Int) { available = limit }
+
+    func acquire() async {
+        if available > 0 {
+            available -= 1
+        } else {
+            await withCheckedContinuation { waiters.append($0) }
+        }
+    }
+
+    func release() {
+        if waiters.isEmpty {
+            available += 1
+        } else {
+            waiters.removeFirst().resume()
+        }
+    }
+}
+
 /// A formatted raw disk image attached (without mounting) as a user-owned /dev/diskN.
 private final class TestDisk {
     let image: URL
@@ -30,28 +56,45 @@ private final class TestDisk {
     /// `windowsDirty` sets the NTFS "volume is dirty" flag the way Windows leaves it after hibernation, Fast Startup
     /// or an unclean shutdown. (Linux's ntfs3 driver never sets it in normal use, so a guest crash does not.)
     init(filesystem: String, sizeMB: Int = 512, windowsDirty: Bool = false) async throws {
-        workDir = FileManager.default.temporaryDirectory.appendingPathComponent("omnifs-it-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
-        image = workDir.appendingPathComponent("\(filesystem).img")
-        try run("/usr/sbin/mkfile", ["-n", "\(sizeMB)m", image.path])
-        try await Self.format(image: image, filesystem: filesystem, workDir: workDir)
-        if windowsDirty {
-            try Self.setNTFSDirtyFlag(image: image)
-        }
+        await DiskSlots.shared.acquire()
+        let workDir = FileManager.default.temporaryDirectory.appendingPathComponent("omnifs-it-\(UUID().uuidString)")
+        let image = workDir.appendingPathComponent("\(filesystem).img")
+        var attached: String?
+        do {
+            try FileManager.default.createDirectory(at: workDir, withIntermediateDirectories: true)
+            try run("/usr/sbin/mkfile", ["-n", "\(sizeMB)m", image.path])
+            try await Self.format(image: image, filesystem: filesystem, workDir: workDir)
+            if windowsDirty {
+                try Self.setNTFSDirtyFlag(image: image)
+            }
 
-        let output = try run("/usr/bin/hdiutil", ["attach", "-imagekey", "diskimage-class=CRawDiskImage", "-nomount", image.path])
-        // One line per device: "/dev/disk5  <content>". Filesystems formatted on the raw image are the whole disk;
-        // ZFS partitions a whole disk itself (like on a real drive), so its pool is the first non-reserved partition.
-        let devices = output.split(separator: "\n").compactMap { line -> (String, String)? in
-            let fields = line.split(separator: "\t").map { $0.trimmingCharacters(in: .whitespaces) }
-            guard let device = fields.first, device.hasPrefix("/dev/disk") else { return nil }
-            return (String(device.dropFirst("/dev/".count)), fields.count > 1 ? fields[1] : "")
+            // diskutil image, not the deprecated hdiutil (whose attaches took ~2 minutes each on macOS 27.3)
+            let output = try run("/usr/sbin/diskutil", ["image", "attach", "--noMount", image.path])
+            guard let device = output.split(whereSeparator: \.isWhitespace).first(where: { $0.hasPrefix("/dev/disk") }) else {
+                throw TestError("diskutil image attach printed no device: \(output)")
+            }
+            let whole = String(device.dropFirst("/dev/".count))
+            attached = whole
+            // Filesystems formatted on the raw image are the whole disk; ZFS partitions a whole disk itself (like on a
+            // real drive), so its pool is the first partition other than ZFS's reserved one
+            let list = try PropertyListSerialization.propertyList(
+                from: Data(try run("/usr/sbin/diskutil", ["list", "-plist", whole]).utf8), format: nil
+            ) as? [String: Any]
+            let partitions = ((list?["AllDisksAndPartitions"] as? [[String: Any]])?.first?["Partitions"] as? [[String: Any]]) ?? []
+            self.bsdName = partitions.first { !(($0["Content"] as? String) ?? "").hasPrefix("6A945A3B") }?["DeviceIdentifier"] as? String
+                ?? whole
+            self.wholeDisk = whole
+            self.workDir = workDir
+            self.image = image
+        } catch {
+            // No TestDisk means no detach(): clean up and give the slot back here, or later tests wait forever
+            if let attached {
+                _ = try? run("/usr/sbin/diskutil", ["eject", "/dev/\(attached)"])
+            }
+            try? FileManager.default.removeItem(at: workDir)
+            await DiskSlots.shared.release()
+            throw error
         }
-        guard let whole = devices.first?.0 else {
-            throw TestError("hdiutil attach printed no device: \(output)")
-        }
-        wholeDisk = whole
-        bsdName = devices.first { $0.0 != whole && !$0.1.hasPrefix("6A945A3B") }?.0 ?? whole
     }
 
     /// Formats the image inside the guest (`omnifs-vmd --format`), then shuts the VM down cleanly.
@@ -121,14 +164,26 @@ private final class TestDisk {
         }
     }
 
+    /// Also tears down a VM mount a failed test left behind, so failures do not leak mounts and VMs
     func detach() {
-        _ = try? run("/usr/bin/hdiutil", ["detach", "-force", "/dev/\(wholeDisk)"])
+        if let record = VMMountRegistry.activeRecord(bsdName: bsdName) {
+            _ = try? run("/sbin/umount", ["-f", record.mountPoint])
+            VMMountRegistry.state(bsdName: bsdName).requestStop()
+            let deadline = Date().addingTimeInterval(40)
+            while VMMountRegistry.activeRecord(bsdName: bsdName) != nil && Date() < deadline {
+                usleep(250_000)
+            }
+        }
+        _ = try? run("/usr/sbin/diskutil", ["eject", "/dev/\(wholeDisk)"])
+        Task { await DiskSlots.shared.release() }
         try? FileManager.default.removeItem(at: workDir)
     }
 }
 
 /// Every filesystem OmniFS serves through the VM.
-private let allFilesystems = ["ntfs", "ext2", "ext3", "ext4", "btrfs", "xfs", "zfs", "f2fs", "udf"]
+private let allFilesystems = ProcessInfo.processInfo.environment["OMNIFS_TEST_FILESYSTEMS"]
+    .map { $0.split(separator: ",").map(String.init) }  // e.g. OMNIFS_TEST_FILESYSTEMS=ntfs,ext4 for a quick run
+    ?? ["ntfs", "ext2", "ext3", "ext4", "btrfs", "xfs", "zfs", "f2fs", "udf"]
 
 /// Filesystems with a checker (udftools has none)
 private let repairableFilesystems = allFilesystems.filter { $0 != "udf" }
@@ -179,6 +234,21 @@ private func waitUntil(seconds: Double, _ condition: () -> Bool) async throws ->
     return condition()
 }
 
+/// Renaming or deleting a folder right after its files were used can be refused for a moment: macOS's SMB client
+/// is still closing them (see the smb.conf comment in Resources/vm/init). Programs have to retry, as here.
+private func retryingBusy<T>(_ body: () throws -> T) throws -> T {
+    let deadline = Date().addingTimeInterval(5)
+    while true {
+        do {
+            return try body()
+        } catch let error as NSError where Date() < deadline {
+            let posix = (error.userInfo[NSUnderlyingErrorKey] as? NSError)?.code ?? error.code
+            guard [Int(EACCES), Int(EBUSY), Int(EPERM)].contains(posix) || error.code == NSFileWriteNoPermissionError else { throw error }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+    }
+}
+
 private func sha256(_ url: URL) throws -> String {
     SHA256.hash(data: try Data(contentsOf: url)).map { String(format: "%02x", $0) }.joined()
 }
@@ -189,7 +259,9 @@ private func makeRandomFile(at url: URL, bytes: Int) throws {
     try data.write(to: url)
 }
 
-@Suite("Volume integration (real disks through the OmniFS VM)", .serialized, .enabled(if: integrationEnabled))
+// Every case has its own disk image and VM, so cases run in parallel across all cores. A hang fails the test
+// instead of stalling the run.
+@Suite("Volume integration (real disks through the OmniFS VM)", .enabled(if: integrationEnabled), .timeLimit(.minutes(3)))
 struct VolumeIntegrationTests {
     init() {
         setenv("OMNIFS_VMD", helper.path, 1)
@@ -269,7 +341,7 @@ struct VolumeIntegrationTests {
         try fm.moveItem(at: moveMe, to: volume.appendingPathComponent("move-me.bin"))
         #expect(!fm.fileExists(atPath: moveMe.path))
         try fm.moveItem(at: volume.appendingPathComponent("move-me.bin"), to: volume.appendingPathComponent("Ünïcode folder/moved.bin"))
-        try fm.moveItem(at: volume.appendingPathComponent("Ünïcode folder"), to: volume.appendingPathComponent("Renamed folder"))
+        try retryingBusy { try fm.moveItem(at: volume.appendingPathComponent("Ünïcode folder"), to: volume.appendingPathComponent("Renamed folder")) }
         #expect(try sha256(volume.appendingPathComponent("Renamed folder/moved.bin")) == moveHash)
 
         // Overwrite in place
@@ -278,9 +350,27 @@ struct VolumeIntegrationTests {
 
         // Delete a file and a whole folder tree
         try fm.removeItem(at: volume.appendingPathComponent("big.bin"))
-        try fm.removeItem(at: volume.appendingPathComponent("Renamed folder"))
+        try retryingBusy { try fm.removeItem(at: volume.appendingPathComponent("Renamed folder")) }
         #expect(!fm.fileExists(atPath: volume.appendingPathComponent("big.bin").path))
         #expect(!fm.fileExists(atPath: volume.appendingPathComponent("Renamed folder").path))
+
+        // File locks (Finder and copyfile take them) must not hang: they stay local to this Mac
+        let lockFile = volume.appendingPathComponent("locked.txt")
+        try "lock".write(to: lockFile, atomically: false, encoding: .utf8)
+        let fd = open(lockFile.path, O_RDWR)
+        #expect(fd >= 0)
+        #expect(flock(fd, LOCK_EX | LOCK_NB) == 0)
+        flock(fd, LOCK_UN)
+        close(fd)
+        try fm.removeItem(at: lockFile)
+
+        // Mac metadata (extended attributes) round-trips; macOS keeps it in ._ files on these volumes
+        let tagged = volume.appendingPathComponent("tagged.txt")
+        try "tagged".write(to: tagged, atomically: false, encoding: .utf8)
+        #expect(setxattr(tagged.path, "com.apple.omnifs.test", "hello", 5, 0, 0) == 0)
+        var buffer = [UInt8](repeating: 0, count: 16)
+        #expect(getxattr(tagged.path, "com.apple.omnifs.test", &buffer, buffer.count, 0, 0) == 5)
+        try fm.removeItem(at: tagged)
 
         // Files must show as the user's own, or Finder refuses to modify or trash them
         let attributes = try fm.attributesOfItem(atPath: volume.path)
@@ -354,7 +444,7 @@ struct VolumeIntegrationTests {
         try await unmount(disk)
     }
 
-    @Test("Move to Trash (macOS gives network-style volumes no Trash)", arguments: ["ntfs"])
+    @Test("Move to Trash (macOS gives network volumes no Trash; Finder deletes immediately instead)", arguments: ["ntfs"])
     func moveToTrash(filesystem: String) async throws {
         let disk = try await TestDisk(filesystem: filesystem)
         defer { disk.detach() }
@@ -362,8 +452,8 @@ struct VolumeIntegrationTests {
         let file = volume.appendingPathComponent("trash-me.txt")
         try "x".write(to: file, atomically: true, encoding: .utf8)
 
-        // Known limitation of the NFS transport: fixing it needs an FSKit module (paid Apple Developer Program)
-        withKnownIssue("NFS volumes have no Trash; use Delete Immediately") {
+        // Known limitation of network volumes: a real Trash needs an FSKit module (paid Apple Developer Program)
+        withKnownIssue("Network volumes have no Trash; Finder offers Delete Immediately") {
             try FileManager.default.trashItem(at: file, resultingItemURL: nil)
         }
         try FileManager.default.removeItem(at: file)
@@ -406,6 +496,21 @@ struct VolumeIntegrationTests {
         // The drive is free again, so it can be mounted once more
         _ = try await mount(disk)
         try await unmount(disk)
+    }
+
+    @Test("Without a custom mount point, volumes mount in /Volumes under their name, like other drives")
+    func mountsInVolumes() async throws {
+        let disk = try await TestDisk(filesystem: "ntfs")
+        defer { disk.detach() }
+        let partition = try #require(await DiskScanner().inspectDisk(bsdName: disk.bsdName))
+        let result = try await MountManager().mount(partition: partition, options: .standardReadWrite)
+        #expect(result.success, "mount failed: \(result.message)")
+        #expect(result.mountPoint.hasPrefix("/Volumes/OMNIFS"))
+        #expect(VMMountRegistry.isMountPoint(result.mountPoint))
+        // The helper tracks the path NetFS chose, so the drive shows as mounted there and unmounts cleanly
+        #expect(await DiskScanner().inspectDisk(bsdName: disk.bsdName)?.mountPoint == result.mountPoint)
+        try await unmount(disk)
+        #expect(!FileManager.default.fileExists(atPath: result.mountPoint))
     }
 
     @Test("A second mount of the same drive is refused while one is in progress")

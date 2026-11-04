@@ -6,8 +6,8 @@ reduced system security:
 
 * **Windows**: `NTFS` (macOS itself only reads NTFS)
 * **Linux**: `ext2`, `ext3`, `ext4`, `Btrfs` (every subvolume and snapshot appears as a folder), `XFS`
-* **Linux & Unix**: `ZFS` (OpenZFS pools from Linux, FreeBSD, TrueNAS, illumos/Solaris; all datasets)
-* **Universal**: `exFAT` and `FAT32` are handed to macOS's own drivers
+* **Linux & Unix**: `ZFS` (OpenZFS pools from Linux, FreeBSD, TrueNAS, illumos/Solaris; all datasets), `F2FS`
+* **Universal**: `UDF`; `exFAT` and `FAT32` are handed to macOS's own drivers
 
 Requires macOS 15+ on Apple Silicon.
 
@@ -21,17 +21,21 @@ filesystem drivers of the Linux kernel itself:
 
 1. `omnifs-vmd` opens the partition (one macOS authorization dialog, through `authopen`) and boots a tiny
    Alpine Linux VM (Linux 6.18 LTS, Apple Virtualization framework) with the partition attached.
-2. The guest mounts it with the kernel driver (`ntfs3`, `ext4`, `btrfs`, `xfs`, OpenZFS) and shares it
-   over NFS on a private virtual network.
-3. macOS mounts that share. The volume appears in Finder under its own name. Ejecting it shuts the guest
-   down cleanly (`umount`, `zpool export`) before the drive is released.
+2. The guest mounts it with the kernel driver (`ntfs3`, `ext4`, `btrfs`, `xfs`, `f2fs`, `udf`, OpenZFS) and
+   shares it over SMB (Samba with `vfs_fruit`, the configuration macOS clients are built for) on a private virtual
+   network, with a password that is only valid for that VM. The VM gets every core and a quarter of the Mac's
+   memory.
+3. macOS mounts the share through NetFS (like Finder's Connect to Server) in `/Volumes`, under the volume's
+   name. Ejecting it shuts the guest down cleanly (`umount`, `zpool export`) before the drive is released.
 
 The same VM runs each filesystem's own checker for **Check & Repair** (`e2fsck`, `ntfsfix`, `xfs_repair`,
 `btrfs check`, `zpool scrub`).
 
 Known limitations:
-* macOS gives network-style volumes no Trash; delete with ⌥⌘⌫ (Delete Immediately).
-* macOS writes `._` files next to files with extended attributes.
+* macOS gives network volumes no Trash: Finder asks to delete items immediately instead.
+* Renaming a folder within a second of using files in it can be refused once (macOS is still closing them);
+  it works when retried.
+* On UDF volumes macOS keeps extended attributes in hidden `._` files (UDF cannot store them).
 * NTFS volumes left dirty by Windows (hibernation / Fast Startup) are refused read & write until checked;
   encrypted ZFS datasets are not supported.
 
@@ -90,9 +94,11 @@ swift test                                                         # Unit tests
 OMNIFS_INTEGRATION=1 swift test --filter VolumeIntegrationTests    # Real disks through the VM (several minutes)
 ```
 
-The integration tests create NTFS, ext2/3/4, Btrfs, XFS and ZFS disk images, attach them as devices and check
-detection, copying in and out, moving, renaming, deleting, persistence, read-only mounts, eject, Btrfs
-subvolumes, ZFS datasets and Check & Repair (including an NTFS volume left dirty by a crash).
+The integration tests create NTFS, ext2/3/4, Btrfs, XFS, ZFS, F2FS and UDF disk images, attach them as devices
+and check detection, copying in and out, moving, renaming, deleting, file locks, native extended attributes,
+persistence, read-only mounts, eject, mounting in /Volumes, Btrfs subvolumes, ZFS datasets and Check & Repair
+(including an NTFS volume Windows left dirty). Cases run in parallel (at most half the cores' worth of disks at
+once, one VM each) with a 3-minute limit; `OMNIFS_TEST_FILESYSTEMS=ntfs,ext4` limits a run to some filesystems.
 
 ---
 
