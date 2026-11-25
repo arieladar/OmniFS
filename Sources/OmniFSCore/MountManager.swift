@@ -18,6 +18,9 @@ public actor MountManager {
             return failure(partition, options, "Another OmniFS operation on \(partition.bsdName) is in progress.")
         }
         defer { VMMountRegistry.releaseLock(lock) }
+        guard try await vmReleased(partition) else {
+            return failure(partition, options, Self.vmBusyMessage(partition))
+        }
 
         var partition = partition
         let fsType = partition.fileSystemType
@@ -282,6 +285,9 @@ public actor MountManager {
             return failure(partition, options, "Another OmniFS operation on \(partition.bsdName) is in progress.")
         }
         defer { VMMountRegistry.releaseLock(lock) }
+        guard try await vmReleased(partition) else {
+            return failure(partition, options, Self.vmBusyMessage(partition))
+        }
 
         guard partition.supportsRepair, let filesystem = vmFilesystemName(for: partition.fileSystemType) else {
             return failure(partition, options, "Check & Repair supports NTFS, ext2/3/4, Btrfs, XFS, ZFS and F2FS. For \(partition.fileSystemType), use Disk Utility's First Aid or the tools of the system that created it.")
@@ -356,6 +362,22 @@ public actor MountManager {
             isReadOnly: vmMount?.readOnly ?? partition.isReadOnly,
             message: message
         )
+    }
+
+    /// False if an omnifs-vmd without a live mount still has the partition open: a Check & Repair whose app or CLI
+    /// quit keeps running, and neither macOS nor a second VM may touch the partition until it has finished. A helper
+    /// that is just shutting down gets a few seconds to exit.
+    private func vmReleased(_ partition: DiskPartition) async throws -> Bool {
+        guard VMMountRegistry.activeRecord(bsdName: partition.bsdName) == nil else { return true }
+        let state = VMMountRegistry.state(bsdName: partition.bsdName)
+        for _ in 0..<10 where state.vmRunning {
+            try await Task.sleep(for: .milliseconds(500))
+        }
+        return !state.vmRunning
+    }
+
+    private static func vmBusyMessage(_ partition: DiskPartition) -> String {
+        "\(partition.bsdName) is still in use by the OmniFS VM (a Check & Repair may still be running). Try again when it has finished."
     }
 
     /// Launches omnifs-vmd in the background with its output going to `log`; returns its process ID.

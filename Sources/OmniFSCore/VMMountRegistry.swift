@@ -56,6 +56,33 @@ public struct VMMountState: Sendable {
 
     public var mountConfirmed: Bool { FileManager.default.fileExists(atPath: mountedFile.path) }
 
+    /// Locked by omnifs-vmd for as long as its VM has the partition open. The state file alone cannot tell: a repair
+    /// writes it only when it finishes, and the operation lock is released when the app or CLI that started the VM
+    /// quits, while the VM keeps running.
+    public var vmLockFile: URL { stateFile.appendingPathExtension("vm-lock") }
+
+    /// Takes the VM lock (non-blocking); returns its descriptor, to be held until the VM has released the partition.
+    public func lockVM() -> Int32? {
+        try? FileManager.default.createDirectory(at: stateFile.deletingLastPathComponent(), withIntermediateDirectories: true)
+        let fd = open(vmLockFile.path, O_CREAT | O_RDWR | O_CLOEXEC, 0o600)
+        guard fd >= 0 else { return nil }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else {
+            close(fd)
+            return nil
+        }
+        return fd
+    }
+
+    /// Whether an omnifs-vmd still has this partition open.
+    public var vmRunning: Bool {
+        let fd = open(vmLockFile.path, O_RDWR | O_CLOEXEC)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        guard flock(fd, LOCK_EX | LOCK_NB) == 0 else { return true }
+        flock(fd, LOCK_UN)
+        return false
+    }
+
     public func read() -> VMMountRecord? {
         guard let data = try? Data(contentsOf: stateFile) else { return nil }
         return try? JSONDecoder().decode(VMMountRecord.self, from: data)

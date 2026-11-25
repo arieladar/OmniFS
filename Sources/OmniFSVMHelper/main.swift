@@ -420,6 +420,17 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
     }
 }
 
-let controller = MainActor.assumeIsolated { GuestController(args: Arguments(CommandLine.arguments)) }
+let arguments = Arguments(CommandLine.arguments)
+// Never two VMs on one partition: a previous helper may still be finishing its shutdown (wait a moment), or still be
+// running a check whose app or CLI has quit
+nonisolated(unsafe) var vmLock: Int32? = VMMountState(stateFile: URL(fileURLWithPath: arguments.stateFile)).lockVM()
+for _ in 0..<50 where vmLock == nil {
+    usleep(100_000)
+    vmLock = VMMountState(stateFile: URL(fileURLWithPath: arguments.stateFile)).lockVM()
+}
+if vmLock == nil {
+    die("\(arguments.disk) is still in use by another OmniFS VM (a Check & Repair may still be running); try again when it has finished")
+}
+let controller = MainActor.assumeIsolated { GuestController(args: arguments) }
 MainActor.assumeIsolated { controller.start() }
 dispatchMain()

@@ -182,6 +182,20 @@ struct OmniFSTests {
         #expect(result?.fileSystemType == .exfat)
     }
 
+    @Test func testVMLockOutlivesOperationLock() throws {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("omnifs-lock-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let state = VMMountState(stateFile: dir.appendingPathComponent("disk99s1.json"))
+        #expect(!state.vmRunning)
+        let fd = try #require(state.lockVM())
+        // A running helper (e.g. a Check & Repair whose app quit) keeps the partition: no second VM, no native mount
+        #expect(state.vmRunning)
+        #expect(state.lockVM() == nil)
+        VMMountRegistry.releaseLock(fd)
+        #expect(!state.vmRunning)
+    }
+
     @Test func testMountOptions() {
         let opts = MountOptions(isReadOnly: false, allowOther: true, customMountPoint: "/Volumes/TestDrive")
         #expect(opts.isReadOnly == false)
