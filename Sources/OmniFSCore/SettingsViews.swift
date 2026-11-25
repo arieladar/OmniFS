@@ -1042,7 +1042,7 @@ public struct AboutOmniFSView: View {
                     VStack(spacing: 3) {
                         Text("OmniFS")
                             .font(.system(size: 20, weight: .bold))
-                        Text("Version 1.0 (Build 2026.10)")
+                        Text("Version 1.0.1 (Build 2026.10)")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
                     }
@@ -1092,7 +1092,7 @@ public struct AboutOmniFSView: View {
         let report = """
         === OmniFS System Diagnostics ===
         Timestamp: \(Date())
-        Version: 1.0 (Build 2026.10)
+        Version: 1.0.1 (Build 2026.10)
         OS: \(ProcessInfo.processInfo.operatingSystemVersionString)
         Architecture: Apple Silicon arm64
         Drivers:
