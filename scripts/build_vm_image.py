@@ -95,7 +95,9 @@ def extract_kernel(vmlinuz, dest):
         data = zlib.decompress(data[offset:offset + size], 16 + zlib.MAX_WBITS)
     if data[0x38:0x3C] != b"ARM\x64":
         sys.exit("error: kernel is not an arm64 Image")
-    open(dest, "wb").write(data)
+    with open(dest + ".part", "wb") as f:
+        f.write(data)
+    os.replace(dest + ".part", dest)
 
 
 def prune_modules(rootfs):
@@ -228,13 +230,16 @@ def main():
     os.chmod(os.path.join(rootfs, "init"), 0o755)
 
     print("[4/4] Packing initramfs...")
+    # Written aside and renamed into place: an interrupted build must not leave a truncated initramfs that is newer
+    # than its sources, which install.sh / build_dmg.sh would then take as up to date and ship
     initramfs = os.path.join(OUT, "initramfs.cpio.gz")
-    with open(initramfs, "wb") as out:
+    with open(initramfs + ".part", "wb") as out:
         cpio = subprocess.Popen(["bsdtar", "--format", "newc", "--uid", "0", "--gid", "0", "-cf", "-", "-C", rootfs, "."],
                                 stdout=subprocess.PIPE)
         subprocess.run(["gzip", "-9"], stdin=cpio.stdout, stdout=out, check=True)
         if cpio.wait() != 0:
             sys.exit("error: bsdtar failed")
+    os.replace(initramfs + ".part", initramfs)
     for f in ("Image", "initramfs.cpio.gz"):
         print(f"  {os.path.join(OUT, f)}  ({os.path.getsize(os.path.join(OUT, f)) // (1 << 20)} MB)")
 
