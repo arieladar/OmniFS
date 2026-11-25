@@ -2,7 +2,7 @@
 # OmniFS guest init: mounts the attached partition (/dev/vda) with the Linux kernel driver
 # and shares it with macOS over SMB, or checks and repairs it. Talks to omnifs-vmd over the console (hvc0):
 #   guest -> host: OMNIFS_WANT_NAME | OMNIFS_WANT_SECRET | OMNIFS_READY ip=<addr> export=<share name>
-#                  | OMNIFS_REPAIRED <summary> | OMNIFS_ERROR <message> | OMNIFS_STOPPED
+#                  | OMNIFS_REPAIRED <summary> | OMNIFS_ERROR <message> | OMNIFS_SYNCING | OMNIFS_STOPPED
 #   host -> guest: <volume name>, <share password> (answering the WANT lines), then "shutdown"
 # Kernel command line: omnifs.fs=<ntfs|ext2|ext3|ext4|btrfs|xfs|zfs|f2fs|udf> omnifs.ro=<0|1>
 #                      omnifs.action=<mount|repair> omnifs.mkfs=<0|1> (test images only)
@@ -268,8 +268,19 @@ while read -r cmd; do
     [ "$cmd" = shutdown ] && break
 done
 
+# killall only signals smbd: wait for it to exit, or its open files keep the volume busy, umount falls back to a
+# lazy unmount and the guest powers off before the filesystem is cleanly unmounted (NTFS then stays dirty)
 killall smbd 2>/dev/null
-sync
+for i in $(seq 100); do pidof smbd >/dev/null || break; sleep 0.1; done
+if pidof smbd >/dev/null; then
+    killall -9 smbd 2>/dev/null
+    for i in $(seq 20); do pidof smbd >/dev/null || break; sleep 0.1; done
+fi
+# Writing back cached data to a slow drive can take minutes: report progress, because omnifs-vmd forces the VM off
+# only after the guest has been silent for a while
+sync &
+SYNC=$!
+while kill -0 "$SYNC" 2>/dev/null; do echo "OMNIFS_SYNCING"; sleep 5; done
 if [ "$TYPE" = "zfs" ]; then
     # Lazy unmount detaches the whole rbind tree at once (busybox umount has no -R)
     umount -l "$EXPORT"

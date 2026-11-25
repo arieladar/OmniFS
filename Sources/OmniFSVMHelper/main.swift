@@ -166,6 +166,10 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
     var waitedForMount = 0
     /// The guest's address once it has reported ready; mounts are only ours if they come from this host
     var guestIP: String?
+    /// When the guest last wrote to its console, and when the shutdown began (see `tick`)
+    var lastGuestOutput = Date()
+    var stoppingSince: Date?
+    let forceStopAfterSilence: TimeInterval = 30
 
     enum Phase { case booting, waitingForMount, mounted, stopping }
 
@@ -270,6 +274,7 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
 
     private func receive(_ data: Data) {
         guard !data.isEmpty else { return }
+        lastGuestOutput = Date()
         FileHandle.standardError.write(data)
         buffer.append(data)
         while let newline = buffer.firstIndex(of: 0x0A) {
@@ -340,7 +345,16 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
             // A running check or repair is never interrupted: that is what damages filesystems
             if state.stopRequested && !args.repair { shutdown(unmountFirst: false) }
         case .stopping:
-            break
+            // Force the VM off if the guest does not power down in time. While it is still flushing cached writes
+            // to a slow drive it keeps reporting (OMNIFS_SYNCING); cutting that short loses data and leaves the
+            // filesystem dirty, so only silence counts, with an overall limit for a guest stuck on a dead drive
+            let now = Date()
+            if let since = stoppingSince,
+               (now.timeIntervalSince(lastGuestOutput) >= forceStopAfterSilence && now.timeIntervalSince(since) >= forceStopAfterSilence)
+                || now.timeIntervalSince(since) >= 600 {
+                vm.stop { _ in }
+                finish(code: 1)
+            }
         }
     }
 
@@ -360,13 +374,7 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
         } else {
             toGuest.fileHandleForWriting.write(Data("shutdown\n".utf8))
         }
-        // Force the VM off if the guest does not power down in time
-        DispatchQueue.main.asyncAfter(deadline: .now() + 30) { [weak self] in
-            MainActor.assumeIsolated {
-                self?.vm.stop { _ in }
-                self?.finish(code: 1)
-            }
-        }
+        stoppingSince = Date()
     }
 
     private func finish(code: Int32) -> Never {
