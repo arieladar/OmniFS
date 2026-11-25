@@ -152,9 +152,10 @@ echo "OMNIFS_WANT_NAME"
 read -r VOLNAME
 VOLNAME=$(echo "$VOLNAME" | tr -d '/"[]')
 [ -n "$VOLNAME" ] || VOLNAME=volume
-echo "OMNIFS_WANT_SECRET"
-# The console echoes input, which would put the password in the helper's log
+# The console echoes input, which would put the password in the helper's log. Echo is turned off before asking:
+# omnifs-vmd answers as soon as it sees the request, and input that arrives before `stty -echo` is still echoed
 stty -echo 2>/dev/null
+echo "OMNIFS_WANT_SECRET"
 read -r SECRET
 stty echo 2>/dev/null
 [ -n "$SECRET" ] || fail "no share password received"
