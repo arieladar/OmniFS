@@ -205,3 +205,21 @@ streams). Image: 33 MB (adds `samba-server`, `samba-common-tools`).
   (`--target=aarch64-linux-musl -nostdlib -shared`). Test: `deleteJustWrittenFolder`.
 - The guest console no longer echoes the share password into `<bsd>.log` (`stty -echo` around the read).
 - Settings: visible Check & Repair (stethoscope) button; the dirty-NTFS error offers Repair & Mount Read & Write.
+
+## Deep review (2026-11-25), version 1.0.1
+
+- Mount identity: the helper and MountManager only checked that the requested `/Volumes/<name>` was *a* mount
+  point. With another drive of the same name mounted there (or a crafted label like `../Volumes/Other`), a failed
+  NetFS mount, a dying guest or SIGTERM ran `umount -f` on that other drive. Mounts now count as the VM's only if
+  they are smbfs mounts from the guest's IP (`VMMountRegistry.isSMBMountPoint`, `VMMountRecord.isShareMounted`).
+- Clean guest shutdown: init waited for nothing after `killall smbd`, so umount could hit busy files, fall back to
+  `umount -l` and power off before the volume was marked clean. It now waits for smbd to exit. The helper no
+  longer forces the VM off 30 s after asking it to stop: the guest reports `OMNIFS_SYNCING` while it writes cached
+  data back, and only 30 s of silence (or 10 minutes in total) forces it off.
+- `<bsd>.json.vm-lock`, held by omnifs-vmd for its whole lifetime: a Check & Repair keeps running after the pane or
+  CLI that started it quits, and a new mount used to start a second VM (or a native mount) on the partition.
+- Sniffer: a corrupt exFAT boot sector overflowed a UInt32 and crashed every scan (and System Settings).
+- Guest: `stty -echo` now runs before `OMNIFS_WANT_SECRET`; the password was still echoed into `<bsd>.log`.
+- `build_vm_image.py` writes Image / initramfs via rename (an interrupted build left a truncated initramfs that
+  looked up to date); `build_dmg.sh` rebuilds the image when `smbdelete-preload.c` changes.
+- `omnifs mount` / `unmount` exit 1 on failure.
