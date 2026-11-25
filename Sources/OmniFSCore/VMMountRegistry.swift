@@ -28,6 +28,14 @@ public struct VMMountRecord: Codable, Sendable {
         self.readOnly = readOnly
         self.message = message
     }
+
+    /// Whether the VM's share is mounted at `mountPoint`. Before MountManager records where NetFS mounted it,
+    /// `mountPoint` is only the requested path, which may be another volume's mount point (a drive with the same
+    /// name, or a path built from a hostile volume label); that volume must never be treated (or unmounted) as this one.
+    public var isShareMounted: Bool {
+        guard let ip else { return false }
+        return VMMountRegistry.isSMBMountPoint(mountPoint, host: ip)
+    }
 }
 
 /// A helper's state file plus its stop-request file (`<state>.stop`), which the unprivileged
@@ -162,6 +170,18 @@ public enum VMMountRegistry {
         defer { free(resolved) }
         let mountedOn = withUnsafeBytes(of: fs.f_mntonname) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
         return mountedOn == String(cString: resolved)
+    }
+
+    /// Whether `path` is the root of an SMB mount of a share on `host` (an OmniFS VM), as opposed to any other
+    /// filesystem that happens to be mounted there.
+    public static func isSMBMountPoint(_ path: String, host: String) -> Bool {
+        guard !host.isEmpty, isMountPoint(path) else { return false }
+        var fs = statfs()
+        guard statfs(path, &fs) == 0 else { return false }
+        let type = withUnsafeBytes(of: fs.f_fstypename) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        // NetFS records SMB mounts as //user@host/share
+        let from = withUnsafeBytes(of: fs.f_mntfromname) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        return type == "smbfs" && (from.contains("@\(host)/") || from.hasPrefix("//\(host)/"))
     }
 
     /// Kernel and initramfs built by scripts/build_vm_image.py.

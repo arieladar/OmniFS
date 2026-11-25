@@ -97,7 +97,7 @@ public actor DiskScanner {
         var isReadOnly = (infoDict["Writable"] as? Bool == false)
 
         // Volumes served by the OmniFS Linux VM are unknown to diskutil
-        if let vmMount = VMMountRegistry.activeRecord(bsdName: bsdName), VMMountRegistry.isMountPoint(vmMount.mountPoint) {
+        if let vmMount = VMMountRegistry.activeRecord(bsdName: bsdName), vmMount.isShareMounted {
             mountPoint = vmMount.mountPoint
             isReadOnly = vmMount.readOnly
         }

@@ -164,6 +164,8 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
     /// Password of the guest's SMB share, valid for this VM only; handed to MountManager through the state file
     let secret = (0..<24).map { _ in "abcdefghijkmnopqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789".randomElement()! }.map(String.init).joined()
     var waitedForMount = 0
+    /// The guest's address once it has reported ready; mounts are only ours if they come from this host
+    var guestIP: String?
 
     enum Phase { case booting, waitingForMount, mounted, stopping }
 
@@ -289,6 +291,7 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
             let ip = String(fields.prefix { $0 != " " })
             let share = fields.range(of: " export=").map { String(fields[$0.upperBound...]) } ?? args.name
             prepareMountPoint()
+            guestIP = ip
             phase = .waitingForMount
             state.write(.init(pid: getpid(), status: .ready, ip: ip, share: share, secret: secret, mountPoint: args.mountPoint, readOnly: args.readOnly, message: nil))
         } else if line.hasPrefix("OMNIFS_REPAIRED "), args.repair {
@@ -309,10 +312,18 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
         state.read()?.mountPoint ?? args.mountPoint
     }
 
+    /// Whether the guest's share is mounted at `path`. The requested path can be another volume's mount point
+    /// (a drive with the same name is already in /Volumes, so NetFS picks "Name-1"); that volume must never be
+    /// mistaken for this one, or force-unmounted when this VM stops.
+    private func isShareMounted(at path: String) -> Bool {
+        guard let guestIP else { return false }
+        return VMMountRegistry.isSMBMountPoint(path, host: guestIP)
+    }
+
     private func tick() {
         switch phase {
         case .waitingForMount:
-            if VMMountRegistry.isMountPoint(mountPoint) || state.mountConfirmed {
+            if isShareMounted(at: mountPoint) || state.mountConfirmed {
                 phase = .mounted
             } else if state.stopRequested || waitedForMount >= 90 {
                 shutdown(unmountFirst: false)
@@ -320,7 +331,7 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
             waitedForMount += 1
         case .mounted:
             // Unmounted from Finder, diskutil or omnifs: release the partition
-            if !VMMountRegistry.isMountPoint(mountPoint) {
+            if !isShareMounted(at: mountPoint) {
                 shutdown(unmountFirst: false)
             } else if state.stopRequested {
                 shutdown(unmountFirst: true)
@@ -337,7 +348,7 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
         guard phase != .stopping else { return }
         let wasBooting = phase == .booting
         phase = .stopping
-        if unmountFirst && VMMountRegistry.isMountPoint(mountPoint) {
+        if unmountFirst && isShareMounted(at: mountPoint) {
             let umount = Process()
             umount.executableURL = URL(fileURLWithPath: "/sbin/umount")
             umount.arguments = ["-f", mountPoint]
@@ -384,7 +395,7 @@ final class GuestController: NSObject, VZVirtualMachineDelegate {
     /// If the guest is gone while macOS still has its share mounted, every access to that mount would hang;
     /// drop the mount so Finder and apps get errors instead
     private func forceUnmount(_ mountPoint: String) {
-        guard VMMountRegistry.isMountPoint(mountPoint) else { return }
+        guard isShareMounted(at: mountPoint) else { return }
         let umount = Process()
         umount.executableURL = URL(fileURLWithPath: "/sbin/umount")
         umount.arguments = ["-f", mountPoint]
