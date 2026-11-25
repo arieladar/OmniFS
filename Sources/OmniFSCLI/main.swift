@@ -90,14 +90,14 @@ struct OmniFSCLI {
     static func handleMount(args: [String]) async {
         guard let bsdName = args.first else {
             print("Error: Missing disk identifier (e.g. omnifs mount disk3s1)")
-            return
+            exit(1)
         }
 
         let isReadOnly = args.contains("--ro")
         let scanner = DiskScanner()
         guard let partition = await scanner.inspectDisk(bsdName: bsdName) else {
             print("Error: Could not locate partition '\(bsdName)'")
-            return
+            exit(1)
         }
 
         print("Mounting \(partition.bsdName) [\(partition.fileSystemType)] in \(isReadOnly ? "Read-Only" : "Read-Write") mode...")
@@ -111,20 +111,22 @@ struct OmniFSCLI {
                 print("✓ Successfully mounted at: \(result.mountPoint)")
             } else {
                 print("✗ Mount failed: \(result.message)")
+                exit(1)
             }
         } catch {
             print("✗ Mount error: \(error)")
+            exit(1)
         }
     }
 
     static func handleRepair(args: [String]) async {
         guard let bsdName = args.first else {
             print("Error: Missing disk identifier (e.g. omnifs repair disk3s1)")
-            return
+            exit(1)
         }
         guard let partition = await DiskScanner().inspectDisk(bsdName: bsdName) else {
             print("Error: Could not locate partition '\(bsdName)'")
-            return
+            exit(1)
         }
         print("Checking \(partition.bsdName) [\(partition.fileSystemType)]... don't disconnect the drive.")
         do {
@@ -140,7 +142,7 @@ struct OmniFSCLI {
     static func handleUnmount(args: [String]) async {
         guard let target = args.first else {
             print("Error: Missing mount target (e.g. omnifs unmount disk3s1)")
-            return
+            exit(1)
         }
 
         print("Unmounting \(target)...")
@@ -150,16 +152,18 @@ struct OmniFSCLI {
                 print("✓ Successfully unmounted \(target)")
             } else {
                 print("✗ Failed to unmount \(target)")
+                exit(1)
             }
         } catch {
             print("✗ Unmount error: \(error)")
+            exit(1)
         }
     }
 
     static func handleInspect(args: [String]) async {
         guard let path = args.first else {
             print("Error: Missing device or image file path (e.g. omnifs inspect /dev/disk3s1)")
-            return
+            exit(1)
         }
 
         print("Inspecting superblock on: \(path)")
