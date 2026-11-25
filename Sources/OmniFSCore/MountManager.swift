@@ -109,7 +109,7 @@ public actor MountManager {
         let wasMountedNatively = partition.isMounted && VMMountRegistry.activeRecord(bsdName: partition.bsdName) == nil
 
         if let existing = VMMountRegistry.activeRecord(bsdName: partition.bsdName) {
-            if VMMountRegistry.isMountPoint(existing.mountPoint) && existing.readOnly == options.isReadOnly {
+            if existing.isShareMounted && existing.readOnly == options.isReadOnly {
                 return MountResult(
                     success: true,
                     mountPoint: existing.mountPoint,
@@ -372,9 +372,9 @@ public actor MountManager {
         guard let record = VMMountRegistry.activeRecord(bsdName: bsdName) else { return true }
         // Right after file activity macOS services (fseventsd, Finder) can hold the volume for a moment and the
         // unmount reports "Resource busy"; retry for a few seconds like Finder does before giving up
-        var unmounted = !VMMountRegistry.isMountPoint(record.mountPoint)
+        var unmounted = !record.isShareMounted
         for _ in 0..<20 where !unmounted {
-            unmounted = try unmountSync(record.mountPoint, force: force) || !VMMountRegistry.isMountPoint(record.mountPoint)
+            unmounted = try unmountSync(record.mountPoint, force: force) || !record.isShareMounted
             if !unmounted {
                 try await Task.sleep(for: .milliseconds(500))
             }

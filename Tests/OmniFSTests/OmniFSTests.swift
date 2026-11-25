@@ -160,6 +160,18 @@ struct OmniFSTests {
         #expect(result?.fileSystemType == .exfat)
     }
 
+    @Test func testVMShareMountIdentity() {
+        // "/" is a mount point, but not an SMB share of the VM: a VM whose requested mount path is another volume's
+        // mount point (a drive with the same name) must never treat that volume as its own
+        #expect(VMMountRegistry.isMountPoint("/"))
+        #expect(!VMMountRegistry.isSMBMountPoint("/", host: "192.168.64.2"))
+        #expect(!VMMountRegistry.isSMBMountPoint("/", host: ""))
+        let other = VMMountRecord(pid: 1, status: .ready, ip: "192.168.64.2", mountPoint: "/", readOnly: false, message: nil)
+        #expect(!other.isShareMounted)
+        let noIP = VMMountRecord(pid: 1, status: .ready, ip: nil, mountPoint: "/", readOnly: false, message: nil)
+        #expect(!noIP.isShareMounted)
+    }
+
     @Test func testMountOptions() {
         let opts = MountOptions(isReadOnly: false, allowOther: true, customMountPoint: "/Volumes/TestDrive")
         #expect(opts.isReadOnly == false)
