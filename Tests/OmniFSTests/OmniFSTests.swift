@@ -172,6 +172,16 @@ struct OmniFSTests {
         #expect(!noIP.isShareMounted)
     }
 
+    @Test func testCorruptExFATBootSectorDoesNotCrash() {
+        // Shift fields are untrusted disk data: 2^16 * 2^16 overflowed UInt32 and crashed the scan (and System Settings)
+        var data = Data(count: 1024)
+        data.replaceSubrange(3..<11, with: "EXFAT   ".data(using: .ascii)!)
+        data[0x6C] = 0xFF
+        data[0x6D] = 0xFF
+        let result = SuperblockSniffer().probe(data: data)
+        #expect(result?.fileSystemType == .exfat)
+    }
+
     @Test func testMountOptions() {
         let opts = MountOptions(isReadOnly: false, allowOther: true, customMountPoint: "/Volumes/TestDrive")
         #expect(opts.isReadOnly == false)

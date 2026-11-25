@@ -394,7 +394,9 @@ public struct SuperblockSniffer: Sendable {
 
         let bytesPerSecShift = data[0x6C]
         let secPerClusShift = data[0x6D]
-        let blockSize = (UInt32(1) << min(bytesPerSecShift, 16)) * (UInt32(1) << min(secPerClusShift, 16))
+        // Untrusted shift counts: valid volumes stay far below 2^31 (cluster size is at most 32 MB), so clamp the sum
+        // instead of letting a corrupt boot sector overflow the multiplication and crash the scan
+        let blockSize = UInt32(1) << min(UInt32(bytesPerSecShift) + UInt32(secPerClusShift), 31)
         let volumeLength = readUInt64LE(data: data, offset: 0x48)
         let serial = readUInt32LE(data: data, offset: 0x64)
 
