@@ -281,7 +281,12 @@ fi
 # only after the guest has been silent for a while
 sync &
 SYNC=$!
-while kill -0 "$SYNC" 2>/dev/null; do echo "OMNIFS_SYNCING"; sleep 5; done
+n=0
+while kill -0 "$SYNC" 2>/dev/null; do
+    [ $((n % 50)) -eq 0 ] && echo "OMNIFS_SYNCING"
+    n=$((n + 1))
+    sleep 0.1
+done
 if [ "$TYPE" = "zfs" ]; then
     # Lazy unmount detaches the whole rbind tree at once (busybox umount has no -R)
     umount -l "$EXPORT"
