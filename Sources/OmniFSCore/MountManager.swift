@@ -381,8 +381,9 @@ public actor MountManager {
         }
         guard unmounted else { return false }
         VMMountRegistry.state(bsdName: bsdName).requestStop()
-        // Longer than the helper's own 30 s force-stop, so a slow guest shutdown still counts as success
-        for _ in 0..<80 where VMMountRegistry.activeRecord(bsdName: bsdName) != nil {
+        // Longer than the helper's own force-stop (30 s of guest silence, at most 10 minutes while the guest is still
+        // writing cached data back to a slow drive), so a slow guest shutdown still counts as success
+        for _ in 0..<1260 where VMMountRegistry.activeRecord(bsdName: bsdName) != nil {
             try await Task.sleep(for: .milliseconds(500))
         }
         return VMMountRegistry.activeRecord(bsdName: bsdName) == nil
